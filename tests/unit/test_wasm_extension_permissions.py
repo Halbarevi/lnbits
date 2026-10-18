@@ -1,0 +1,988 @@
+from types import SimpleNamespace
+from typing import Any, cast
+
+import pytest
+from pytest_mock.plugin import MockerFixture
+
+from lnbits.core.models.extensions import (
+    ExtensionBackgroundPaymentDestinationPolicy,
+    ExtensionPermission,
+)
+from lnbits.core.views.extension_api import (
+    WALLET_PAY_INVOICE_BACKGROUND_PERMISSION,
+    WALLET_PAYMENTS_WATCH_PERMISSION,
+    _background_destination_policy_covers,
+    _check_background_payment_permission,
+    _check_wallet_payments_watch_permission,
+    _find_background_payment_grant,
+    _find_wallet_payments_watch_grant,
+    _remove_user_permission_grant,
+    _safe_user_extension_permissions,
+    _user_permission_grant_id_for_wallet,
+)
+from lnbits.core.wasm_ext.api.permissions import (
+    PUBLIC_APPEND_MAX_ROWS_PER_SOURCE_LIMIT,
+    validate_wasm_extension_permissions,
+)
+from lnbits.core.wasm_ext.api.websockets import (
+    WEBSOCKET_PUBLISH_MAX_MESSAGES_PER_SECOND_LIMIT,
+)
+from lnbits.core.wasm_ext.wasm.events import _wasm_invoice_paid_owner_id
+from lnbits.core.wasm_ext.wasm.invoke import _active_installed_extension
+from tests.helpers import make_installable_extension
+
+
+@pytest.fixture
+def scheduler_permission_config():
+    config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "scheduler.user",
+                "policies": [
+                    {"handler": "check", "cron_expression": "*/10 * * * *"},
+                    {"handler": "other", "cron_expression": "0 * * * *"},
+                ],
+            },
+            {
+                "id": "scheduler.extension",
+                "policies": [
+                    {
+                        "handler": "check",
+                        "cron_expression": "* * * * *",
+                        "timezone": "Europe/Bucharest",
+                    }
+                ],
+            },
+        ],
+    )
+    config["wasm"]["exports"] = [
+        {"name": name, "visibility": "event"} for name in ("check", "other")
+    ]
+    return config
+
+
+def test_scheduler_permissions_approve_exact_schedules_per_handler_and_scope(
+    scheduler_permission_config,
+):
+    config = scheduler_permission_config
+    extension = make_installable_extension("demoext")
+    grants = [ExtensionPermission.parse_obj(item) for item in config["permissions"]]
+    assert validate_wasm_extension_permissions(extension, grants, config) == grants
+    # Admins can approve only some declared handlers and omit the shared permission.
+    grants[0].policies = [
+        {"handler": "check", "cron_expression": "*/10 * ? * *", "timezone": "UTC"}
+    ]
+    assert (
+        validate_wasm_extension_permissions(extension, grants[:1], config) == grants[:1]
+    )
+    assert validate_wasm_extension_permissions(extension, [], config) == []
+
+
+@pytest.mark.parametrize(
+    "policies",
+    [
+        None,
+        [],
+        ["*/10 * * * *"],
+        [{}],
+        [{"handler": "check", "cron_expression": "* * * * * *"}],
+        [
+            {
+                "handler": "check",
+                "cron_expression": "*/10 * * * *",
+                "timezone": "invalid",
+            }
+        ],
+        [{"handler": "check", "cron_expression": "*/10 * * * *", "enabled": False}],
+        [{"handler": "missing", "cron_expression": "*/10 * * * *"}],
+        [{"handler": "check", "cron_expression": "*/10 * * * *"}] * 2,
+    ],
+)
+def test_scheduler_permissions_reject_invalid_manifest_policies(
+    policies, scheduler_permission_config
+):
+    scheduler_permission_config["permissions"][0]["policies"] = policies
+    with pytest.raises(ValueError, match="invalid policies"):
+        validate_wasm_extension_permissions(
+            make_installable_extension("demoext"), [], scheduler_permission_config
+        )
+
+
+@pytest.mark.parametrize("visibility", ["authenticated", "public"])
+def test_scheduler_permissions_require_event_handlers(
+    visibility, scheduler_permission_config
+):
+    scheduler_permission_config["wasm"]["exports"][0]["visibility"] = visibility
+    with pytest.raises(ValueError, match="event exports"):
+        validate_wasm_extension_permissions(
+            make_installable_extension("demoext"), [], scheduler_permission_config
+        )
+
+
+@pytest.mark.parametrize("allow_admin_policy_overrides", [False, True])
+@pytest.mark.parametrize(
+    "policies",
+    [
+        None,
+        [],
+        [{"handler": "missing", "cron_expression": "*/10 * * * *"}],
+        [{"handler": "check", "cron_expression": "* * * * *"}],
+        [{"handler": "check", "cron_expression": "*/20 * * * *"}],
+        [
+            {
+                "handler": "check",
+                "cron_expression": "*/10 * * * *",
+                "timezone": "Europe/Bucharest",
+            }
+        ],
+        [{"handler": "check", "cron_expression": "*/10 * * * *"}] * 2,
+    ],
+)
+def test_scheduler_permissions_reject_unrequested_schedules(
+    policies, allow_admin_policy_overrides, scheduler_permission_config
+):
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            make_installable_extension("demoext"),
+            [ExtensionPermission(id="scheduler.user", policies=policies)],
+            scheduler_permission_config,
+            allow_admin_policy_overrides=allow_admin_policy_overrides,
+        )
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "10", None])
+def test_scheduler_permissions_reject_invalid_job_limits(
+    limit, scheduler_permission_config
+):
+    config = scheduler_permission_config
+    grants = [
+        ExtensionPermission.parse_obj(item).copy(deep=True)
+        for item in config["permissions"]
+    ]
+    assert grants[0].policies is not None
+    grants[0].policies[0]["max_jobs_per_user"] = limit
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            make_installable_extension("demoext"),
+            grants,
+            config,
+            allow_admin_policy_overrides=True,
+        )
+    config["permissions"][0]["policies"][0]["max_jobs_per_user"] = limit
+    with pytest.raises(ValueError, match="invalid policies"):
+        validate_wasm_extension_permissions(
+            make_installable_extension("demoext"), [], config
+        )
+
+
+@pytest.mark.parametrize("limit", [1, 10, 20])
+@pytest.mark.parametrize("admin_override", [False, True])
+def test_scheduler_permissions_job_limit_overrides(
+    limit, admin_override, scheduler_permission_config
+):
+    config = scheduler_permission_config
+    grants = [
+        ExtensionPermission.parse_obj(item).copy(deep=True)
+        for item in config["permissions"]
+    ]
+    assert grants[0].policies is not None
+    grants[0].policies[0]["max_jobs_per_user"] = limit
+    if limit > 10 and not admin_override:
+        with pytest.raises(ValueError, match="broader policies"):
+            validate_wasm_extension_permissions(
+                make_installable_extension("demoext"), grants, config
+            )
+    else:
+        assert (
+            validate_wasm_extension_permissions(
+                make_installable_extension("demoext"),
+                grants,
+                config,
+                allow_admin_policy_overrides=admin_override,
+            )
+            == grants
+        )
+
+
+def test_validate_wasm_permissions_rejects_broader_policy_grant():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "http.request",
+                "policies": [{"host": "https://api.example.com"}],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="http.request",
+                    policies=[
+                        {"host": "https://api.example.com"},
+                        {"host": "https://evil.example.com"},
+                    ],
+                )
+            ],
+            extension_config,
+        )
+
+
+def test_validate_wasm_permissions_stores_narrower_policy_grant():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "ext.storage.read_public",
+                "description": "Read public storage.",
+                "policies": [
+                    {
+                        "table_name": "tip_jars",
+                        "source_id_field": "wallet_id",
+                        "public_fields": ["id", "title", "description"],
+                    }
+                ],
+            }
+        ],
+    )
+
+    permissions = validate_wasm_extension_permissions(
+        ext_info,
+        [
+            ExtensionPermission(
+                id="ext.storage.read_public",
+                policies=[
+                    {
+                        "table_name": "tip_jars",
+                        "source_id_field": "wallet_id",
+                        "public_fields": ["id", "title"],
+                    }
+                ],
+            )
+        ],
+        extension_config,
+    )
+
+    assert permissions == [
+        ExtensionPermission(
+            id="ext.storage.read_public",
+            description="Read public storage.",
+            policies=[
+                {
+                    "table_name": "tip_jars",
+                    "source_id_field": "wallet_id",
+                    "public_fields": ["id", "title"],
+                }
+            ],
+        )
+    ]
+
+
+def test_validate_wasm_permissions_rejects_public_read_source_field_omission():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "ext.storage.read_public",
+                "policies": [
+                    {
+                        "table_name": "messages",
+                        "source_id_field": "conversation_id",
+                        "public_fields": ["id", "body"],
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="ext.storage.read_public",
+                    policies=[
+                        {
+                            "table_name": "messages",
+                            "public_fields": ["id", "body"],
+                        }
+                    ],
+                )
+            ],
+            extension_config,
+        )
+
+
+def test_validate_wasm_permissions_allows_narrower_public_append_grant():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "ext.storage.append_public",
+                "description": "Append public messages.",
+                "policies": [
+                    {
+                        "table": "messages",
+                        "source_table": "threads",
+                        "source_id_field": "thread_id",
+                        "allowed_fields": ["name", "message"],
+                        "max_rows_per_source": 100,
+                    }
+                ],
+            }
+        ],
+    )
+
+    permissions = validate_wasm_extension_permissions(
+        ext_info,
+        [
+            ExtensionPermission(
+                id="ext.storage.append_public",
+                policies=[
+                    {
+                        "table": "messages",
+                        "source_table": "threads",
+                        "source_id_field": "thread_id",
+                        "allowed_fields": ["message"],
+                        "max_rows_per_source": 50,
+                    }
+                ],
+            )
+        ],
+        extension_config,
+    )
+
+    assert permissions == [
+        ExtensionPermission(
+            id="ext.storage.append_public",
+            description="Append public messages.",
+            policies=[
+                {
+                    "table": "messages",
+                    "source_table": "threads",
+                    "source_id_field": "thread_id",
+                    "allowed_fields": ["message"],
+                    "max_rows_per_source": 50,
+                }
+            ],
+        )
+    ]
+
+
+def test_validate_wasm_permissions_rejects_broader_public_append_grant():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "ext.storage.append_public",
+                "policies": [
+                    {
+                        "table": "messages",
+                        "source_table": "threads",
+                        "source_id_field": "thread_id",
+                        "allowed_fields": ["message"],
+                        "max_rows_per_source": 100,
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="ext.storage.append_public",
+                    policies=[
+                        {
+                            "table": "messages",
+                            "source_table": "threads",
+                            "source_id_field": "thread_id",
+                            "allowed_fields": ["message", "admin"],
+                            "max_rows_per_source": 101,
+                        }
+                    ],
+                )
+            ],
+            extension_config,
+        )
+
+
+def test_validate_wasm_permissions_admin_can_raise_public_append_row_limit():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "ext.storage.append_public",
+                "description": "Append public messages.",
+                "policies": [
+                    {
+                        "table": "messages",
+                        "source_table": "threads",
+                        "source_id_field": "thread_id",
+                        "allowed_fields": ["message"],
+                        "max_rows_per_source": 100,
+                    }
+                ],
+            }
+        ],
+    )
+
+    permissions = validate_wasm_extension_permissions(
+        ext_info,
+        [
+            ExtensionPermission(
+                id="ext.storage.append_public",
+                policies=[
+                    {
+                        "table": "messages",
+                        "source_table": "threads",
+                        "source_id_field": "thread_id",
+                        "allowed_fields": ["message"],
+                        "max_rows_per_source": 500,
+                    }
+                ],
+            )
+        ],
+        extension_config,
+        allow_admin_policy_overrides=True,
+    )
+
+    assert permissions == [
+        ExtensionPermission(
+            id="ext.storage.append_public",
+            description="Append public messages.",
+            policies=[
+                {
+                    "table": "messages",
+                    "source_table": "threads",
+                    "source_id_field": "thread_id",
+                    "allowed_fields": ["message"],
+                    "max_rows_per_source": 500,
+                }
+            ],
+        )
+    ]
+
+
+def test_validate_wasm_permissions_admin_cannot_raise_public_append_fields_or_cap():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "ext.storage.append_public",
+                "policies": [
+                    {
+                        "table": "messages",
+                        "source_table": "threads",
+                        "source_id_field": "thread_id",
+                        "allowed_fields": ["message"],
+                        "max_rows_per_source": 100,
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="ext.storage.append_public",
+                    policies=[
+                        {
+                            "table": "messages",
+                            "source_table": "threads",
+                            "source_id_field": "thread_id",
+                            "allowed_fields": ["message", "admin"],
+                            "max_rows_per_source": 500,
+                        }
+                    ],
+                )
+            ],
+            extension_config,
+            allow_admin_policy_overrides=True,
+        )
+
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="ext.storage.append_public",
+                    policies=[
+                        {
+                            "table": "messages",
+                            "source_table": "threads",
+                            "source_id_field": "thread_id",
+                            "allowed_fields": ["message"],
+                            "max_rows_per_source": (
+                                PUBLIC_APPEND_MAX_ROWS_PER_SOURCE_LIMIT + 1
+                            ),
+                        }
+                    ],
+                )
+            ],
+            extension_config,
+            allow_admin_policy_overrides=True,
+        )
+
+
+def test_validate_wasm_permissions_rejects_broader_extension_api_access():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "extension.api.request",
+                "policies": [{"id": "targetext", "access": ["read"]}],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="extension.api.request",
+                    policies=[{"id": "targetext", "access": ["read", "write"]}],
+                )
+            ],
+            extension_config,
+        )
+
+
+def test_validate_wasm_permissions_allows_empty_grant():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "wallet.create_invoice_public",
+                "policies": [{"table": "tip_jars", "wallet_field": "wallet_id"}],
+            }
+        ],
+    )
+
+    assert validate_wasm_extension_permissions(ext_info, [], extension_config) == []
+
+
+def test_validate_wasm_permissions_rejects_unrequested_permission_grant():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config("demoext", [{"id": "utils.basic"}])
+
+    with pytest.raises(ValueError, match="unrequested permissions"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(id="utils.basic"),
+                ExtensionPermission(id="wallet.list"),
+            ],
+            extension_config,
+        )
+
+
+def test_validate_wasm_permissions_allows_wallet_payments_watch_permission():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [{"id": "wallet.payments.watch"}],
+    )
+
+    assert validate_wasm_extension_permissions(
+        ext_info,
+        [ExtensionPermission(id="wallet.payments.watch")],
+        extension_config,
+    ) == [ExtensionPermission(id="wallet.payments.watch")]
+
+
+def test_validate_wasm_permissions_allows_websocket_permissions():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "websocket.publish",
+                "policies": [{"max_messages_per_second": 10}],
+            },
+            {"id": "websocket.subscribe"},
+        ],
+    )
+
+    assert validate_wasm_extension_permissions(
+        ext_info,
+        [
+            ExtensionPermission(
+                id="websocket.publish",
+                policies=[{"max_messages_per_second": 5}],
+            ),
+            ExtensionPermission(id="websocket.subscribe"),
+        ],
+        extension_config,
+    ) == [
+        ExtensionPermission(
+            id="websocket.publish",
+            policies=[{"max_messages_per_second": 5}],
+        ),
+        ExtensionPermission(id="websocket.subscribe"),
+    ]
+
+
+def test_validate_wasm_permissions_rejects_websocket_publish_without_policy():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [{"id": "websocket.publish"}],
+    )
+
+    with pytest.raises(ValueError, match="invalid policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [ExtensionPermission(id="websocket.publish")],
+            extension_config,
+        )
+
+
+def test_validate_wasm_permissions_rejects_broader_websocket_publish_limit():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "websocket.publish",
+                "policies": [{"max_messages_per_second": 10}],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="broader policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="websocket.publish",
+                    policies=[{"max_messages_per_second": 11}],
+                )
+            ],
+            extension_config,
+        )
+
+
+def test_validate_wasm_permissions_admin_can_raise_websocket_publish_limit():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "websocket.publish",
+                "policies": [{"max_messages_per_second": 10}],
+            }
+        ],
+    )
+
+    assert validate_wasm_extension_permissions(
+        ext_info,
+        [
+            ExtensionPermission(
+                id="websocket.publish",
+                policies=[{"max_messages_per_second": 20}],
+            )
+        ],
+        extension_config,
+        allow_admin_policy_overrides=True,
+    ) == [
+        ExtensionPermission(
+            id="websocket.publish",
+            policies=[{"max_messages_per_second": 20}],
+        )
+    ]
+
+
+def test_validate_wasm_permissions_rejects_websocket_publish_limit_over_cap():
+    ext_info = make_installable_extension("demoext")
+    extension_config = _wasm_config(
+        "demoext",
+        [
+            {
+                "id": "websocket.publish",
+                "policies": [
+                    {
+                        "max_messages_per_second": (
+                            WEBSOCKET_PUBLISH_MAX_MESSAGES_PER_SECOND_LIMIT + 1
+                        )
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="invalid policies"):
+        validate_wasm_extension_permissions(
+            ext_info,
+            [
+                ExtensionPermission(
+                    id="websocket.publish",
+                    policies=[
+                        {
+                            "max_messages_per_second": (
+                                WEBSOCKET_PUBLISH_MAX_MESSAGES_PER_SECOND_LIMIT + 1
+                            )
+                        }
+                    ],
+                )
+            ],
+            extension_config,
+            allow_admin_policy_overrides=True,
+        )
+
+
+def test_background_payment_grant_lookup_and_policy_coverage():
+    permissions = {
+        WALLET_PAY_INVOICE_BACKGROUND_PERMISSION: [
+            {
+                "id": "grant-1",
+                "wallet_id": "wallet-1",
+                "enabled": True,
+                "max_amount": 5000,
+                "destination_policy": "external_allowed",
+            }
+        ]
+    }
+
+    grant = _find_background_payment_grant(permissions, "wallet-1")
+
+    assert grant
+    assert grant.max_amount == 5000
+    assert _background_destination_policy_covers(
+        grant.destination_policy,
+        ExtensionBackgroundPaymentDestinationPolicy.OWN_WALLETS_ONLY,
+    )
+    assert _background_destination_policy_covers(
+        grant.destination_policy,
+        ExtensionBackgroundPaymentDestinationPolicy.EXTERNAL_ALLOWED,
+    )
+    assert not _background_destination_policy_covers(
+        ExtensionBackgroundPaymentDestinationPolicy.OWN_WALLETS_ONLY,
+        ExtensionBackgroundPaymentDestinationPolicy.EXTERNAL_ALLOWED,
+    )
+
+
+def test_wallet_payments_watch_grant_lookup_ignores_disabled_grant():
+    permissions = {
+        WALLET_PAYMENTS_WATCH_PERMISSION: [
+            {"id": "grant-1", "wallet_id": "wallet-1", "enabled": False}
+        ]
+    }
+
+    grant = _find_wallet_payments_watch_grant(permissions, "wallet-1")
+
+    assert grant
+    assert grant.enabled is False
+
+
+def test_safe_user_extension_permissions_keeps_only_grants_with_ids():
+    permissions = {
+        WALLET_PAYMENTS_WATCH_PERMISSION: [
+            {"id": "grant-1", "wallet_id": "wallet-1", "enabled": True},
+            {"wallet_id": "wallet-2", "enabled": True},
+            "broken",
+        ],
+        "broken": "not-a-list",
+    }
+
+    safe_permissions = _safe_user_extension_permissions(permissions)
+
+    assert safe_permissions == {
+        WALLET_PAYMENTS_WATCH_PERMISSION: [
+            {"id": "grant-1", "wallet_id": "wallet-1", "enabled": True}
+        ]
+    }
+
+
+def test_user_permission_grant_id_for_wallet_returns_existing_grant_id():
+    permissions = {
+        WALLET_PAY_INVOICE_BACKGROUND_PERMISSION: [
+            {"id": "grant-1", "wallet_id": "wallet-1", "enabled": True}
+        ]
+    }
+
+    grant_id = _user_permission_grant_id_for_wallet(
+        permissions, WALLET_PAY_INVOICE_BACKGROUND_PERMISSION, "wallet-1"
+    )
+
+    assert grant_id == "grant-1"
+
+
+def test_remove_user_permission_grant_removes_only_matching_grant_id():
+    permissions = {
+        WALLET_PAY_INVOICE_BACKGROUND_PERMISSION: [
+            {"id": "grant-1", "wallet_id": "wallet-1", "enabled": True},
+            {"id": "grant-2", "wallet_id": "wallet-2", "enabled": True},
+        ],
+        WALLET_PAYMENTS_WATCH_PERMISSION: [{"id": "grant-3", "wallet_id": "wallet-1"}],
+    }
+
+    updated_permissions = _remove_user_permission_grant(permissions, "grant-1")
+
+    assert updated_permissions == {
+        WALLET_PAY_INVOICE_BACKGROUND_PERMISSION: [
+            {"id": "grant-2", "wallet_id": "wallet-2", "enabled": True}
+        ],
+        WALLET_PAYMENTS_WATCH_PERMISSION: [{"id": "grant-3", "wallet_id": "wallet-1"}],
+    }
+
+
+def test_remove_user_permission_grant_drops_empty_permission():
+    permissions = {
+        WALLET_PAYMENTS_WATCH_PERMISSION: [{"id": "grant-1", "wallet_id": "wallet-1"}]
+    }
+
+    updated_permissions = _remove_user_permission_grant(permissions, "grant-1")
+
+    assert updated_permissions == {}
+
+
+@pytest.mark.anyio
+async def test_background_payment_check_reports_approved_grant(
+    mocker: MockerFixture,
+):
+    permissions = {
+        WALLET_PAY_INVOICE_BACKGROUND_PERMISSION: [
+            {
+                "id": "grant-1",
+                "wallet_id": "wallet-1",
+                "enabled": True,
+                "max_amount": 5000,
+                "destination_policy": "external_allowed",
+            }
+        ]
+    }
+    mocker.patch(
+        "lnbits.core.views.extension_api.get_wallet",
+        mocker.AsyncMock(
+            return_value=SimpleNamespace(
+                user="user-1",
+                is_lightning_shared_wallet=False,
+                can_send_payments=True,
+            )
+        ),
+    )
+
+    result = await _check_background_payment_permission(
+        "user-1",
+        permissions,
+        {
+            "wallet_id": "wallet-1",
+            "max_amount": 1000,
+            "destination_policy": "own_wallets_only",
+        },
+    )
+
+    assert result.id == WALLET_PAY_INVOICE_BACKGROUND_PERMISSION
+    assert result.approved is True
+    assert result.grant["id"] == "grant-1"
+    assert result.grant["max_amount"] == 5000
+
+
+@pytest.mark.anyio
+async def test_wallet_payment_watch_check_returns_requested_unapproved_grant(
+    mocker: MockerFixture,
+):
+    mocker.patch(
+        "lnbits.core.views.extension_api.get_wallet",
+        mocker.AsyncMock(return_value=SimpleNamespace(user="user-1")),
+    )
+
+    result = await _check_wallet_payments_watch_permission(
+        "user-1",
+        {},
+        {"wallet_id": "wallet-1"},
+    )
+
+    assert result.id == WALLET_PAYMENTS_WATCH_PERMISSION
+    assert result.approved is False
+    assert result.grant["wallet_id"] == "wallet-1"
+    assert result.grant["enabled"] is True
+    assert isinstance(result.grant["id"], str)
+
+
+@pytest.mark.anyio
+async def test_invoice_paid_owner_lookup_uses_stored_granted_policies(
+    mocker: MockerFixture,
+):
+    extension = SimpleNamespace(
+        id="demoext",
+        config=_wasm_config(
+            "demoext",
+            [
+                {
+                    "id": "wallet.create_invoice_public",
+                    "policies": [
+                        {"table": "requested_table", "wallet_field": "wallet_id"}
+                    ],
+                }
+            ],
+        ),
+    )
+    payment = SimpleNamespace(extra={"source_id": "source-1"})
+    installed_extension = SimpleNamespace(
+        permissions=[
+            ExtensionPermission(
+                id="wallet.create_invoice_public",
+                policies=[{"table": "granted_table", "wallet_field": "wallet_id"}],
+            )
+        ]
+    )
+    mocker.patch(
+        "lnbits.core.wasm_ext.wasm.events.get_installed_extension",
+        mocker.AsyncMock(return_value=installed_extension),
+    )
+    storage_mock = mocker.patch(
+        "lnbits.core.wasm_ext.wasm.events.storage_get_row_owner_id",
+        mocker.AsyncMock(return_value="owner-1"),
+    )
+
+    owner_id = await _wasm_invoice_paid_owner_id(extension, payment)
+
+    assert owner_id == "owner-1"
+    storage_mock.assert_awaited_once_with("demoext", "granted_table", "source-1")
+
+
+@pytest.mark.anyio
+async def test_wasm_invocation_requires_installed_active_extension(
+    mocker: MockerFixture,
+):
+    extension = SimpleNamespace(id="demoext")
+    mocker.patch(
+        "lnbits.core.wasm_ext.wasm.invoke.get_installed_extension",
+        mocker.AsyncMock(return_value=None),
+    )
+
+    with pytest.raises(PermissionError, match="deactivated"):
+        await _active_installed_extension(cast(Any, extension))
+
+
+def _wasm_config(ext_id: str, permissions: list[dict]) -> dict:
+    return {
+        "id": ext_id,
+        "name": ext_id,
+        "short_description": "Demo extension",
+        "version": "1.0.0",
+        "extension_type": "wasm",
+        "wasm": {"module": "extension.wasm"},
+        "permissions": permissions,
+    }

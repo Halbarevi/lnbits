@@ -1,0 +1,243 @@
+import hashlib
+import json
+import os
+import time
+from subprocess import PIPE, CalledProcessError, Popen, TimeoutExpired
+from uuid import uuid4
+
+from loguru import logger
+
+from lnbits.wallets import get_funding_source
+
+funding_source = get_funding_source()
+is_boltz_wallet = funding_source.__class__.__name__ == "BoltzWallet"
+
+docker_lightning_cli = [
+    "docker",
+    "exec",
+    "lnbits-lnd-1-1",
+    "lncli",
+    "--network",
+    "regtest",
+    "--rpcserver=lnd-1",
+]
+
+docker_offer_cli = [
+    "docker",
+    "exec",
+    "lnbits-clightning-3-1",
+    "lightning-cli",
+    "--network=regtest",
+    "-k",
+]
+
+docker_bitcoin_cli = [
+    "docker",
+    "exec",
+    "lnbits-bitcoind-1",
+    "bitcoin-cli",
+    "-regtest",
+]
+
+
+docker_elements_cli = [
+    "docker",
+    "exec",
+    "lnbits-elementsd-1",
+    "elements-cli",
+    "-rpcport=18884",
+    "-chain=liquidregtest",
+]
+
+docker_boltz_cli = [
+    "docker",
+    "exec",
+    "lnbits-boltz-client-1",
+    "boltzcli",
+    "--host",
+    "boltz-client",
+    "--no-macaroons",
+]
+
+
+docker_lightning_unconnected_cli = [
+    "docker",
+    "exec",
+    "lnbits-lnd-2-1",
+    "lncli",
+    "--network",
+    "regtest",
+    "--rpcserver=lnd-2",
+]
+
+
+docker_lightning_noroute_cli = [
+    "docker",
+    "exec",
+    "lnbits-lnd-4-1",
+    "lncli",
+    "--network",
+    "regtest",
+    "--rpcserver=lnd-4",
+]
+
+
+def run_cmd(cmd: list) -> str:
+    timeout = 30
+    process = Popen(cmd, stdout=PIPE, stderr=PIPE)
+
+    logger.debug(f"running command: {cmd}")
+
+    def process_communication(comm):
+        stdout, stderr = comm
+        output = stdout.decode("utf-8").strip()
+        error = stderr.decode("utf-8").strip()
+        return output, error
+
+    try:
+        now = time.time()
+        output, error = process_communication(process.communicate(timeout=timeout))
+        took = time.time() - now
+        logger.debug(f"ran command output: {output}, error: {error}, took: {took}s")
+        if process.returncode:
+            raise CalledProcessError(
+                process.returncode,
+                cmd,
+                output=output,
+                stderr=error,
+            )
+        return output
+    except TimeoutExpired:
+        process.kill()
+        output, error = process_communication(process.communicate())
+        logger.error(f"timeout command: {cmd}, output: {output}, error: {error}")
+        raise
+
+
+def run_cmd_json(cmd: list) -> dict:
+    output = run_cmd(cmd)
+    try:
+        return json.loads(output) if output else {}
+    except json.decoder.JSONDecodeError:
+        logger.error(f"failed to decode json from cmd `{cmd}`: {output}")
+        raise
+
+
+def get_hold_invoice(sats: int) -> tuple[str, dict]:
+    preimage = os.urandom(32)
+    preimage_hash = hashlib.sha256(preimage).hexdigest()
+    cmd = docker_lightning_cli.copy()
+    cmd.extend(["addholdinvoice", preimage_hash, str(sats)])
+    json = run_cmd_json(cmd)
+    return preimage.hex(), json
+
+
+def lookup_invoice(payment_hash: str) -> dict:
+    cmd = docker_lightning_cli.copy()
+    cmd.extend(["lookupinvoice", payment_hash])
+    return run_cmd_json(cmd)
+
+
+def settle_invoice(preimage: str) -> str:
+    cmd = docker_lightning_cli.copy()
+    cmd.extend(["settleinvoice", preimage])
+    return run_cmd(cmd)
+
+
+def cancel_invoice(preimage_hash: str) -> str:
+    cmd = docker_lightning_cli.copy()
+    cmd.extend(["cancelinvoice", preimage_hash])
+    return run_cmd(cmd)
+
+
+def get_real_invoice(sats: int) -> dict:
+    cmd = docker_lightning_cli.copy()
+    cmd.extend(["addinvoice", str(sats)])
+    return run_cmd_json(cmd)
+
+
+def get_real_offer(sats: int | None) -> dict:
+    amount = f"{sats}sat" if sats is not None else "any"
+    description = f"regtest-{uuid4().hex}"
+    offer = run_cmd_json(
+        [
+            *docker_offer_cli,
+            "offer",
+            f"amount={amount}",
+            f"description={description}",
+        ]
+    )
+    return {**offer, "description": description}
+
+
+def lookup_offer_invoices(offer_id: str) -> dict:
+    return run_cmd_json([*docker_offer_cli, "listinvoices", f"offer_id={offer_id}"])
+
+
+def get_real_invoice_noroute(sats: int) -> dict:
+    cmd = docker_lightning_noroute_cli.copy()
+    cmd.extend(["addinvoice", str(sats)])
+    return run_cmd_json(cmd)
+
+
+def pay_real_invoice(invoice: str) -> str:
+    cmd = docker_lightning_cli.copy()
+    cmd.extend(["payinvoice", "--force", invoice])
+    return run_cmd(cmd)
+
+
+def mine_blocks(blocks: int = 1) -> str:
+    cmd = docker_bitcoin_cli.copy()
+    cmd.extend(["-generate", str(blocks)])
+    return run_cmd(cmd)
+
+
+def mine_blocks_liquid(blocks: int = 1) -> str:
+    cmd = docker_elements_cli.copy()
+    cmd.extend(["-generate", str(blocks)])
+    return run_cmd(cmd)
+
+
+def sync_boltz_liquid_chain(timeout: float = 15) -> None:
+    mine_blocks_liquid()
+
+    cmd = docker_elements_cli.copy()
+    cmd.append("getblockcount")
+    target_height = int(run_cmd(cmd))
+
+    deadline = time.time() + timeout
+    height = 0
+    while time.time() < deadline:
+        cmd = docker_boltz_cli.copy()
+        cmd.append("getinfo")
+        info = run_cmd_json(cmd)
+        height = int(info["blockHeights"]["liquid"])
+        if height >= target_height:
+            return
+        time.sleep(0.25)
+
+    raise AssertionError(
+        f"Boltz did not sync to Liquid block {target_height} within {timeout}s. "
+        f"Last block: {height}."
+    )
+
+
+def get_unconnected_node_uri() -> str:
+    cmd = docker_lightning_unconnected_cli.copy()
+    cmd.append("getinfo")
+    info = run_cmd_json(cmd)
+    pubkey = info["identity_pubkey"]
+    return f"{pubkey}@lnd-2:9735"
+
+
+def create_onchain_address(address_type: str = "bech32") -> str:
+    cmd = docker_bitcoin_cli.copy()
+    cmd.extend(["getnewaddress", address_type])
+    return run_cmd(cmd)
+
+
+def pay_onchain(address: str, sats: int) -> str:
+    btc = sats * 0.00000001
+    cmd = docker_bitcoin_cli.copy()
+    cmd.extend(["sendtoaddress", address, str(btc)])
+    return run_cmd(cmd)

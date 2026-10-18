@@ -1,0 +1,993 @@
+window.PageWallet = {
+  template: '#page-wallet',
+  data() {
+    return {
+      onchainPaymentFilter: {},
+      parse: {
+        show: false,
+        invoice: null,
+        lnurlpay: null,
+        lnurlauth: null,
+        sending: false,
+        decoding: false,
+        decodeId: 0,
+        data: {
+          request: '',
+          amount: 0,
+          comment: '',
+          memo: '',
+          internalMemo: null,
+          unit: 'sat'
+        },
+        paymentChecker: null,
+        copy: {
+          show: false
+        },
+        camera: {
+          show: false,
+          camera: 'auto'
+        }
+      },
+      receive: {
+        show: false,
+        status: 'pending',
+        paymentReq: null,
+        paymentHash: null,
+        amountMsat: null,
+        minMax: [0, 2100000000000000],
+        lnurl: null,
+        units: [],
+        unit: 'sat',
+        fiatProvider: '',
+        data: {
+          amount: null,
+          memo: '',
+          internalMemo: null,
+          payment_hash: null
+        }
+      },
+      update: {
+        name: null,
+        currency: null
+      },
+      hasNfc: false,
+      nfcReaderAbortController: null,
+      formattedFiatAmount: 0,
+      totalBreakdown: {
+        show: false,
+        loading: false,
+        rows: [],
+        selectedTypes: ['bitcoin', 'fiat'],
+        selectedTags: []
+      },
+      paymentFilter: {
+        'status[ne]': 'failed'
+      },
+      chartConfig: Quasar.LocalStorage.getItem(
+        'lnbits.wallets.chartConfig'
+      ) || {
+        showPaymentInOutChart: true,
+        showBalanceChart: true,
+        showBalanceInOutChart: true
+      }
+    }
+  },
+  computed: {
+    isFiatWallet() {
+      return this.g.wallet.walletType === 'fiat'
+    },
+    isCashPayment() {
+      return this.isFiatWallet && this.receive.fiatProvider === 'cash'
+    },
+    bolt12AmountMissing() {
+      return !!(
+        this.parse.invoice &&
+        this.parse.invoice.isBolt12Offer &&
+        !(Number(this.parse.data.amount) > 0)
+      )
+    },
+    canPay() {
+      if (!this.parse.invoice) return false
+      if (this.parse.invoice.expired) {
+        Quasar.Notify.create({
+          message: 'Invoice has expired',
+          color: 'negative'
+        })
+        return false
+      }
+      if (this.parse.invoice.isBolt12Offer) {
+        if (this.bolt12AmountMissing) {
+          return true
+        }
+        return Number(this.parse.data.amount) <= this.g.wallet.sat
+      }
+      return this.parse.invoice.sat <= this.g.wallet.sat
+    },
+    lnurlpayInfo() {
+      // parse.lnurlpay is posted back to the api verbatim when paying, and the
+      // model there forbids unknown fields, so the details the dialog shows are
+      // derived here instead of being mixed into it
+      const data = this.parse.lnurlpay
+      if (!data) return {}
+      const info = {
+        domain: data.callback.split('/')[2],
+        fixed: data.minSendable === data.maxSendable
+      }
+      try {
+        JSON.parse(data.metadata).forEach(([kind, value]) => {
+          if (kind === 'text/plain') {
+            info.description = value
+          } else if (
+            kind === 'image/png;base64' ||
+            kind === 'image/jpeg;base64'
+          ) {
+            info.image = `data:${kind},${value}`
+          } else if (kind === 'text/identifier' || kind === 'text/email') {
+            info.targetUser = value
+          }
+        })
+      } catch {
+        // malformed metadata only costs the extra detail shown in the dialog
+      }
+      return info
+    },
+    formattedAmount() {
+      if (this.isFiatWallet) {
+        return LNbits.utils.formatCurrency(
+          this.receive.data.amount,
+          this.receive.unit
+        )
+      }
+      if (this.receive.unit != 'sat' || !this.g.isSatsDenomination) {
+        return LNbits.utils.formatCurrency(
+          Number(this.receive.data.amount).toFixed(2),
+          !this.g.isSatsDenomination ? this.g.denomination : this.receive.unit
+        )
+      } else {
+        return LNbits.utils.formatMsat(this.receive.amountMsat) + ' sat'
+      }
+    },
+    formattedSatAmount() {
+      return LNbits.utils.formatMsat(this.receive.amountMsat) + ' sat'
+    },
+    totalBreakdownTags() {
+      const tags = this.totalBreakdown.rows.map(row => row.tag || null)
+      return [...new Set(tags)].sort((a, b) =>
+        this.totalBreakdownTagLabel(a).localeCompare(
+          this.totalBreakdownTagLabel(b)
+        )
+      )
+    },
+    hasFiatTotalBreakdown() {
+      return this.totalBreakdown.rows.some(row => row.is_fiat)
+    },
+    selectedTotalBreakdownRows() {
+      return this.totalBreakdown.rows.filter(row => {
+        const type = row.is_fiat ? 'fiat' : 'bitcoin'
+        return (
+          this.totalBreakdown.selectedTypes.includes(type) &&
+          this.totalBreakdown.selectedTags.includes(
+            this.totalBreakdownTagKey(row.tag)
+          )
+        )
+      })
+    },
+    selectedTotalBreakdownMsat() {
+      return this.selectedTotalBreakdownRows.reduce(
+        (total, row) => total + row.total,
+        0
+      )
+    },
+    selectedTotalBreakdownSat() {
+      return Math.round(this.selectedTotalBreakdownMsat / 1000)
+    },
+    selectedTotalBreakdownCount() {
+      return this.selectedTotalBreakdownRows.reduce(
+        (total, row) => total + row.payments_count,
+        0
+      )
+    },
+    formattedTotalBreakdown() {
+      return this.utils.formatBalance(
+        this.selectedTotalBreakdownSat,
+        this.g.denomination
+      )
+    },
+    formattedTotalBreakdownFiat() {
+      if (!this.g.fiatTracking) return null
+      const amount =
+        (this.selectedTotalBreakdownSat / 100000000) * this.g.exchangeRate
+      return LNbits.utils.formatCurrency(amount, this.g.wallet.currency)
+    },
+    primaryTotalBreakdownValue() {
+      if (this.g.isFiatPriority && this.g.fiatTracking) {
+        return this.formattedTotalBreakdownFiat || this.formattedTotalBreakdown
+      }
+      return this.formattedTotalBreakdown
+    },
+    secondaryTotalBreakdownValue() {
+      if (!this.g.fiatTracking) return null
+      if (this.g.isFiatPriority) {
+        return this.formattedTotalBreakdown
+      }
+      return this.formattedTotalBreakdownFiat
+    }
+  },
+  methods: {
+    showWalletTotalBreakdown() {
+      this.totalBreakdown.show = true
+      if (!this.totalBreakdown.rows.length) {
+        this.fetchTotalBreakdown()
+      }
+    },
+    fetchTotalBreakdown() {
+      this.totalBreakdown.loading = true
+      LNbits.api
+        .getPaymentTotalBreakdown(this.g.wallet)
+        .then(response => {
+          this.totalBreakdown.rows = response.data
+          this.totalBreakdown.selectedTypes = ['bitcoin', 'fiat']
+          this.totalBreakdown.selectedTags = this.totalBreakdownTags.map(
+            this.totalBreakdownTagKey
+          )
+          this.totalBreakdown.loading = false
+        })
+        .catch(err => {
+          this.totalBreakdown.loading = false
+          LNbits.utils.notifyApiError(err)
+        })
+    },
+    totalBreakdownTagLabel(tag) {
+      return tag || 'No tag'
+    },
+    totalBreakdownTagKey(tag) {
+      return tag || '__untagged__'
+    },
+    totalBreakdownTagCount(tag) {
+      return this.totalBreakdown.rows
+        .filter(row => (row.tag || null) === tag)
+        .reduce((total, row) => total + row.payments_count, 0)
+    },
+    totalBreakdownTagMsat(tag) {
+      return this.totalBreakdown.rows
+        .filter(row => (row.tag || null) === tag)
+        .reduce((total, row) => total + row.total, 0)
+    },
+    formatTotalBreakdownMsat(msat) {
+      return this.utils.formatBalance(
+        Math.round(msat / 1000),
+        this.g.denomination
+      )
+    },
+    handleSendLnurl(lnurl) {
+      this.parse.data.request = lnurl
+      this.parse.show = true
+      this.lnurlScan()
+    },
+    msatoshiFormat(value) {
+      return LNbits.utils.formatSat(value / 1000)
+    },
+    showReceiveDialog() {
+      this.receive.show = true
+      this.receive.status = 'pending'
+      this.receive.paymentReq = null
+      this.receive.paymentHash = null
+      this.receive.fiatPaymentReq = null
+      this.receive.fiatProvider = this.isFiatWallet ? 'cash' : ''
+      this.receive.data.amount = null
+      this.receive.data.memo = null
+      this.receive.data.internalMemo = null
+      this.receive.data.payment_hash = null
+      this.receive.units = [
+        ...(this.isFiatWallet ? [] : ['sat']),
+        ...(this.g.allowedCurrencies.length > 0
+          ? this.g.allowedCurrencies
+          : this.g.currencies)
+      ]
+      this.receive.unit = this.g.isFiatPriority
+        ? this.g.wallet.currency || 'sat'
+        : 'sat'
+      if (this.isFiatWallet) {
+        this.receive.unit = this.receive.units.includes(this.g.wallet.currency)
+          ? this.g.wallet.currency
+          : this.receive.units[0]
+      }
+      this.receive.minMax = [0, 2100000000000000]
+      this.receive.lnurl = null
+      this.receive.lnurlWithdraw = null
+    },
+    onReceiveDialogHide() {
+      if (this.hasNfc) {
+        this.nfcReaderAbortController?.abort()
+      }
+    },
+    showParseDialog() {
+      this.parse.show = true
+      this.parse.invoice = null
+      this.parse.lnurlpay = null
+      this.parse.lnurlauth = null
+      this.parse.copy.show =
+        window.isSecureContext && navigator.clipboard?.readText !== undefined
+      this.parse.data.request = ''
+      this.parse.data.comment = ''
+      this.parse.data.amount = 0
+      this.parse.data.internalMemo = null
+      this.parse.data.memo = ''
+      this.parse.sending = false
+      this.parse.data.paymentChecker = null
+      this.parse.camera.show = false
+    },
+    closeParseDialog() {
+      this.parse.decodeId++
+      this.parse.decoding = false
+      setTimeout(() => {
+        clearInterval(this.parse.paymentChecker)
+      }, 10000)
+    },
+    handleBalanceUpdate(value) {
+      this.g.wallet.sat = this.g.wallet.sat + value
+    },
+    createInvoice() {
+      if (this.receive.status === 'loading') return
+      this.receive.status = 'loading'
+      if (!this.isFiatWallet && !this.g.isSatsDenomination) {
+        this.receive.data.amount = this.receive.data.amount * 100
+      }
+
+      const cash = this.isCashPayment
+      const request = cash
+        ? LNbits.api.request(
+            'POST',
+            '/api/v1/fiat/cash',
+            this.g.wallet.adminkey,
+            {
+              amount: this.receive.data.amount,
+              unit: this.receive.unit,
+              memo: this.receive.data.memo,
+              internal_memo: this.receive.data.internalMemo
+            }
+          )
+        : LNbits.api.createInvoice(
+            this.g.wallet,
+            this.receive.data.amount,
+            this.receive.data.memo,
+            this.receive.unit,
+            this.receive.lnurlWithdraw,
+            this.receive.fiatProvider,
+            this.receive.data.internalMemo,
+            this.receive.data.payment_hash
+          )
+      request
+        .then(response => {
+          this.g.updatePayments = !this.g.updatePayments
+          this.receive.status = 'success'
+          if (cash) {
+            this.receive.show = false
+            Quasar.Notify.create({
+              type: 'positive',
+              message: 'Cash payment validated.'
+            })
+            return
+          }
+          this.receive.paymentReq = response.data.bolt11
+          this.receive.fiatPaymentReq =
+            response.data.extra?.fiat_payment_request
+          this.receive.amountMsat = response.data.amount
+          this.receive.paymentHash = response.data.payment_hash
+          if (!this.isFiatWallet && !this.receive.lnurl) {
+            this.readNfcTag()
+          }
+          // WITHDRAW
+          if (
+            this.receive.lnurl &&
+            response.data.extra?.lnurl_response !== null
+          ) {
+            if (response.data.extra.lnurl_response === false) {
+              response.data.extra.lnurl_response = `Unable to connect`
+            }
+            const domain = this.receive.lnurl.callback.split('/')[2]
+            if (typeof response.data.extra.lnurl_response === 'string') {
+              // failure
+              Quasar.Notify.create({
+                timeout: 5000,
+                type: 'warning',
+                message: `${domain} lnurl-withdraw call failed.`,
+                caption: response.data.extra.lnurl_response
+              })
+              return
+            } else if (response.data.extra.lnurl_response === true) {
+              // success
+              Quasar.Notify.create({
+                timeout: 3000,
+                message: `Invoice sent to ${domain}!`,
+                spinner: true
+              })
+            }
+          }
+        })
+        .catch(err => {
+          LNbits.utils.notifyApiError(err)
+          this.receive.status = 'pending'
+        })
+    },
+    lnurlScan() {
+      LNbits.api
+        .request('POST', '/api/v1/lnurlscan', this.g.wallet.adminkey, {
+          lnurl: this.parse.data.request
+        })
+        .then(response => {
+          const data = response.data
+          if (data.status === 'ERROR') {
+            Quasar.Notify.create({
+              timeout: 5000,
+              type: 'warning',
+              message: `lnurl scan failed.`,
+              caption: data.reason
+            })
+            return
+          }
+
+          if (data.tag === 'payRequest') {
+            this.parse.lnurlpay = Object.freeze(data)
+            this.parse.data.amount = data.minSendable / 1000
+            this.receive.units = [
+              'sats',
+              ...(this.g.allowedCurrencies.length > 0
+                ? this.g.allowedCurrencies
+                : this.g.currencies)
+            ]
+          } else if (data.tag === 'login') {
+            this.parse.lnurlauth = Object.freeze(data)
+          } else if (data.tag === 'withdrawRequest') {
+            this.parse.show = false
+            this.receive.show = true
+            this.receive.lnurlWithdraw = Object.freeze(data)
+            this.receive.status = 'pending'
+            this.receive.paymentReq = null
+            this.receive.paymentHash = null
+            this.receive.data.amount = data.maxWithdrawable / 1000
+            this.receive.data.memo = data.defaultDescription
+            this.receive.minMax = [
+              data.minWithdrawable / 1000,
+              data.maxWithdrawable / 1000
+            ]
+            const domain = data.callback.split('/')[2]
+            this.receive.lnurl = {
+              domain: domain,
+              callback: data.callback,
+              fixed: data.fixed
+            }
+          }
+        })
+        .catch(err => {
+          LNbits.utils.notifyApiError(err)
+        })
+    },
+    decodeQR(val) {
+      this.parse.data.request = val
+      this.decodeRequest()
+      this.parse.camera.show = false
+    },
+    isLnurl(req) {
+      return (
+        req.toLowerCase().startsWith('lnurl1') ||
+        req.startsWith('lnurlp://') ||
+        req.startsWith('lnurlw://') ||
+        req.startsWith('lnurlauth://') ||
+        req.match(/[\w.+-~_]+@[\w.+-~_]/)
+      )
+    },
+    isBolt12Offer(req) {
+      const text = (req || '').trim().toLowerCase()
+      return text.startsWith('lno1')
+    },
+    async decodeRequest() {
+      if (this.parse.decoding) return
+      this.parse.show = true
+      this.parse.data.request = this.parse.data.request.trim()
+      const req = this.parse.data.request.toLowerCase()
+      if (req.startsWith('lightning:')) {
+        this.parse.data.request = this.parse.data.request.slice(10)
+        if (this.parse.data.request.startsWith('//')) {
+          this.parse.data.request = this.parse.data.request.slice(2)
+        }
+      } else if (req.startsWith('lnurl:')) {
+        this.parse.data.request = this.parse.data.request.slice(6)
+      } else if (req.includes('lightning=lnurl1')) {
+        this.parse.data.request = this.parse.data.request
+          .split('lightning=')[1]
+          .split('&')[0]
+      }
+      if (this.isLnurl(this.parse.data.request)) {
+        this.lnurlScan()
+        return
+      }
+
+      if (this.isBolt12Offer(this.parse.data.request)) {
+        const offer = this.parse.data.request.trim().split('?')[0].split('#')[0]
+        this.parse.data.request = offer
+        this.parse.data.amount = 0
+        this.parse.invoice = null
+        this.parse.decoding = true
+        const decodeId = ++this.parse.decodeId
+        try {
+          const {data} = await LNbits.api.request(
+            'post',
+            '/api/v1/payments/decode',
+            null,
+            {data: offer}
+          )
+          if (decodeId !== this.parse.decodeId || !this.parse.show) return
+          // Offer payments currently accept whole sats only. Never round an
+          // amount or interpret a foreign currency's minor units as sats.
+          const amount =
+            data.currency == null &&
+            Number.isSafeInteger(data.amount) &&
+            data.amount > 0 &&
+            data.amount % 1000 === 0
+              ? data.amount / 1000
+              : 0
+          this.parse.data.request = data.offer
+          this.parse.data.amount = amount
+          this.parse.invoice = Object.freeze({
+            msat: data.currency == null ? data.amount : null,
+            sat: amount,
+            fsat: 'offer',
+            bolt11: data.offer,
+            description: data.description,
+            hash: null,
+            isBolt12Offer: true,
+            expired: false
+          })
+        } catch (error) {
+          if (decodeId === this.parse.decodeId && this.parse.show) {
+            Quasar.Notify.create({
+              type: 'warning',
+              message: error.response?.data?.message || error.message
+            })
+          }
+        } finally {
+          if (decodeId === this.parse.decodeId) this.parse.decoding = false
+        }
+        return
+      }
+
+      // BIP-21 support
+      if (this.parse.data.request.toLowerCase().includes('lightning')) {
+        this.parse.data.request = this.parse.data.request.split('lightning=')[1]
+
+        // fail safe to check there's nothing after the lightning= part
+        if (this.parse.data.request.includes('&')) {
+          this.parse.data.request = this.parse.data.request.split('&')[0]
+        }
+      }
+
+      let invoice
+      try {
+        invoice = decode(this.parse.data.request)
+      } catch (error) {
+        Quasar.Notify.create({
+          timeout: 3000,
+          type: 'warning',
+          message: error + '.',
+          caption: '400 BAD REQUEST'
+        })
+        this.parse.show = false
+        return
+      }
+
+      let cleanInvoice = {
+        msat: invoice.human_readable_part.amount,
+        sat: invoice.human_readable_part.amount / 1000,
+        fsat: LNbits.utils.formatSat(invoice.human_readable_part.amount / 1000),
+        bolt11: this.parse.data.request
+      }
+
+      _.each(invoice.data.tags, tag => {
+        if (_.isObject(tag) && _.has(tag, 'description')) {
+          if (tag.description === 'payment_hash') {
+            cleanInvoice.hash = tag.value
+          } else if (tag.description === 'description') {
+            cleanInvoice.description = tag.value
+          } else if (tag.description === 'expiry') {
+            const expireDate = new Date(
+              (invoice.data.time_stamp + tag.value) * 1000
+            )
+            const createdDate = new Date(invoice.data.time_stamp * 1000)
+            cleanInvoice.expireDate = Quasar.date.formatDate(
+              expireDate,
+              'YYYY-MM-DDTHH:mm:ss.SSSZ'
+            )
+            cleanInvoice.createdDate = Quasar.date.formatDate(
+              createdDate,
+              'YYYY-MM-DDTHH:mm:ss.SSSZ'
+            )
+            cleanInvoice.expireDateFrom = moment
+              .utc(expireDate)
+              .local()
+              .fromNow()
+            cleanInvoice.createdDateFrom = moment
+              .utc(createdDate)
+              .local()
+              .fromNow()
+
+            cleanInvoice.expired = false // TODO
+          }
+        }
+      })
+
+      if (this.g.wallet.currency) {
+        cleanInvoice.fiatAmount = LNbits.utils.formatCurrency(
+          ((cleanInvoice.sat / 1e8) * this.g.exchangeRate).toFixed(2),
+          this.g.wallet.currency
+        )
+      }
+
+      this.parse.invoice = Object.freeze(cleanInvoice)
+    },
+    payInvoice() {
+      if (this.parse.sending) return
+      if (
+        this.parse.invoice?.isBolt12Offer &&
+        !(Number(this.parse.data.amount) > 0)
+      ) {
+        return
+      }
+
+      this.parse.sending = true
+      const dismissPaymentMsg = Quasar.Notify.create({
+        timeout: 0,
+        message: this.$t('payment_processing')
+      })
+
+      const amount = this.parse.invoice.isBolt12Offer
+        ? this.parse.data.amount
+        : null
+      LNbits.api
+        .payInvoice(
+          this.g.wallet,
+          this.parse.data.request,
+          this.parse.data.internalMemo,
+          amount,
+          this.parse.invoice.isBolt12Offer ? this.parse.data.memo : null
+        )
+        .then(response => {
+          this.parse.sending = false
+          dismissPaymentMsg()
+          this.g.updatePayments = !this.g.updatePayments
+          this.parse.show = false
+          if (response.data.status == 'success') {
+            Quasar.Notify.create({
+              type: 'positive',
+              message: this.$t('payment_successful')
+            })
+          }
+          if (response.data.status == 'pending') {
+            Quasar.Notify.create({
+              type: 'info',
+              message: this.$t('payment_pending')
+            })
+          }
+        })
+        .catch(err => {
+          this.parse.sending = false
+          dismissPaymentMsg()
+          LNbits.utils.notifyApiError(err)
+          this.g.updatePayments = !this.g.updatePayments
+        })
+    },
+    payLnurl() {
+      if (this.parse.sending) return
+
+      this.parse.sending = true
+      LNbits.api
+        .request('post', '/api/v1/payments/lnurl', this.g.wallet.adminkey, {
+          res: this.parse.lnurlpay,
+          lnurl: this.parse.data.request,
+          unit: this.parse.data.unit,
+          amount: this.parse.data.amount * 1000,
+          comment: this.parse.data.comment,
+          internalMemo: this.parse.data.internalMemo
+        })
+        .then(response => {
+          this.parse.sending = false
+          this.parse.show = false
+          if (response.data.extra.success_action) {
+            const action = JSON.parse(response.data.extra.success_action)
+            switch (action.tag) {
+              case 'url':
+                Quasar.Notify.create({
+                  message: action.url,
+                  caption: action.description,
+                  html: false,
+                  type: 'positive',
+                  timeout: 0,
+                  closeBtn: true,
+                  actions: [
+                    {
+                      label: 'Open link',
+                      color: 'white',
+                      handler: () => this.utils.openUrlInNewTab(action.url)
+                    }
+                  ]
+                })
+                break
+              case 'message':
+                Quasar.Notify.create({
+                  message: action.message,
+                  type: 'positive',
+                  timeout: 0,
+                  closeBtn: true
+                })
+                break
+              case 'aes':
+                this.utils
+                  .decryptLnurlPayAES(action, response.data.preimage)
+                  .then(value => {
+                    Quasar.Notify.create({
+                      message: value,
+                      caption: action.description,
+                      html: false,
+                      type: 'positive',
+                      timeout: 0,
+                      closeBtn: true
+                    })
+                  })
+                  .catch(error => {
+                    Quasar.Notify.create({
+                      message: action.description || 'Payment successful.',
+                      caption: 'Could not decrypt success action.',
+                      html: false,
+                      type: 'warning',
+                      timeout: 0,
+                      closeBtn: true
+                    })
+                  })
+                break
+            }
+          }
+        })
+        .catch(err => {
+          this.parse.sending = false
+          LNbits.utils.notifyApiError(err)
+        })
+    },
+    authLnurl() {
+      const dismissAuthMsg = Quasar.Notify.create({
+        timeout: 10,
+        message: 'Performing authentication...'
+      })
+      LNbits.api
+        .request(
+          'post',
+          '/api/v1/lnurlauth',
+          wallet.adminkey,
+          this.parse.lnurlauth
+        )
+        .then(_ => {
+          dismissAuthMsg()
+          Quasar.Notify.create({
+            message: `Authentication successful.`,
+            type: 'positive',
+            timeout: 3500
+          })
+          this.parse.show = false
+        })
+        .catch(err => {
+          if (err.response.data.reason) {
+            Quasar.Notify.create({
+              message: `Authentication failed. ${this.parse.lnurlauth.callback} says:`,
+              caption: err.response.data.reason,
+              type: 'warning',
+              timeout: 5000
+            })
+          } else {
+            LNbits.utils.notifyApiError(err)
+          }
+        })
+    },
+    updateWallet(data) {
+      LNbits.api
+        .request('PATCH', '/api/v1/wallet', this.g.wallet.adminkey, data)
+        .then(response => {
+          const walletData = {...response.data}
+          if (walletData.lightning_address) {
+            walletData.lightningAddress = walletData.lightning_address
+            walletData.lightningAddressFull = `${walletData.lightning_address}@${window.location.host}`
+          }
+          this.g.wallet = {...this.g.wallet, ...walletData}
+          const walletIndex = this.g.user.wallets.findIndex(
+            wallet => wallet.id === response.data.id
+          )
+          if (walletIndex !== -1) {
+            this.g.user.wallets[walletIndex] = {
+              ...this.g.user.wallets[walletIndex],
+              ...walletData
+            }
+          }
+          Quasar.Notify.create({
+            message: 'Wallet updated.',
+            type: 'positive',
+            timeout: 3500
+          })
+        })
+        .catch(err => {
+          LNbits.utils.notifyApiError(err)
+        })
+    },
+    pasteToTextArea() {
+      this.$refs.textArea.focus()
+      navigator.clipboard.readText().then(text => {
+        this.parse.data.request = text.trim()
+      })
+    },
+    readNfcTag() {
+      try {
+        if (typeof NDEFReader == 'undefined') {
+          console.debug('NFC not supported on this device or browser.')
+          return
+        }
+
+        const ndef = new NDEFReader()
+
+        this.nfcReaderAbortController = new AbortController()
+        this.nfcReaderAbortController.signal.onabort = event => {
+          console.debug('All NFC Read operations have been aborted.')
+        }
+
+        this.hasNfc = true
+        const dismissNfcTapMsg = Quasar.Notify.create({
+          message: 'Tap your NFC tag to pay this invoice with LNURLw.'
+        })
+
+        return ndef
+          .scan({signal: this.nfcReaderAbortController.signal})
+          .then(() => {
+            ndef.onreadingerror = () => {
+              Quasar.Notify.create({
+                type: 'negative',
+                message: 'There was an error reading this NFC tag.'
+              })
+            }
+
+            ndef.onreading = ({message}) => {
+              //Decode NDEF data from tag
+              const textDecoder = new TextDecoder('utf-8')
+
+              const record = message.records.find(el => {
+                const payload = textDecoder.decode(el.data)
+                return payload.toUpperCase().indexOf('LNURLW') !== -1
+              })
+
+              if (record) {
+                dismissNfcTapMsg()
+                Quasar.Notify.create({
+                  type: 'positive',
+                  message: 'NFC tag read successfully.'
+                })
+                const lnurl = textDecoder.decode(record.data)
+                this.payInvoiceWithNfc(lnurl)
+              } else {
+                Quasar.Notify.create({
+                  type: 'warning',
+                  message: 'NFC tag does not have LNURLw record.'
+                })
+              }
+            }
+          })
+      } catch (error) {
+        Quasar.Notify.create({
+          type: 'negative',
+          message: error
+            ? error.toString()
+            : 'An unexpected error has occurred.'
+        })
+      }
+    },
+    payInvoiceWithNfc(lnurl) {
+      const dismissPaymentMsg = Quasar.Notify.create({
+        timeout: 0,
+        spinner: true,
+        message: this.$t('payment_processing')
+      })
+
+      LNbits.api
+        .request(
+          'POST',
+          `/api/v1/payments/${this.receive.paymentReq}/pay-with-nfc`,
+          this.g.wallet.adminkey,
+          {lnurl_w: lnurl}
+        )
+        .then(response => {
+          dismissPaymentMsg()
+          if (response.data.success) {
+            Quasar.Notify.create({
+              type: 'positive',
+              message: 'Payment successful'
+            })
+          } else {
+            Quasar.Notify.create({
+              type: 'negative',
+              message: response.data.detail || 'Payment failed'
+            })
+          }
+        })
+        .catch(err => {
+          dismissPaymentMsg()
+          LNbits.utils.notifyApiError(err)
+        })
+    }
+  },
+  created() {
+    const urlParams = new URLSearchParams(window.location.search)
+    const wallet = this.g.user.wallets.find(w => w.id === this.$route.params.id)
+    if (wallet) {
+      this.g.wallet = wallet
+      this.g.lastActiveWallet = wallet.id
+      this.$q.localStorage.setItem('lnbits.lastActiveWallet', wallet.id)
+      // the dialog needs the wallet, and a dialog opened while this navigation
+      // is still in flight gets torn down by it, so handle the payment request
+      // only once the url rewrite has settled
+      this.$router.replace(`/wallet/${wallet.id}`).then(() => {
+        if (
+          wallet.walletType !== 'onchain' &&
+          (urlParams.has('lightning') || urlParams.has('lnurl'))
+        ) {
+          this.parse.data.request =
+            urlParams.get('lightning') || urlParams.get('lnurl')
+          this.decodeRequest()
+          this.parse.show = true
+        }
+      })
+    } else {
+      this.g.errorCode = 404
+      this.g.errorMessage = 'Wallet not found.'
+      this.$router.push('/error')
+    }
+  },
+  watch: {
+    'g.updatePaymentsHash'() {
+      this.receive.show = false
+    },
+    'g.updatePayments'() {
+      this.parse.show = false
+      if (
+        this.g.wallet.currency &&
+        this.$q.localStorage.getItem(
+          'lnbits.exchangeRate.' + this.g.wallet.currency
+        )
+      ) {
+        this.g.exchangeRate = this.$q.localStorage.getItem(
+          'lnbits.exchangeRate.' + this.g.wallet.currency
+        )
+        this.g.fiatBalance =
+          (this.g.exchangeRate / 100000000) * this.g.wallet.sat
+      }
+    },
+    'g.wallet'() {
+      if (this.g.wallet.currency) {
+        this.g.fiatTracking = true
+        this.g.fiatBalance =
+          (this.g.exchangeRate / 100000000) * this.g.wallet.sat
+      } else {
+        this.g.fiatBalance = 0
+        this.g.fiatTracking = false
+      }
+    },
+    'g.isFiatPriority'() {
+      this.receive.unit = this.g.isFiatPriority ? this.g.wallet.currency : 'sat'
+    },
+    'g.fiatBalance'() {
+      this.formattedFiatAmount = LNbits.utils.formatCurrency(
+        this.g.fiatBalance.toFixed(2),
+        this.g.wallet.currency
+      )
+    },
+    'g.exchangeRate'() {
+      if (this.g.fiatTracking && this.g.wallet.currency) {
+        this.g.fiatBalance =
+          (this.g.exchangeRate / 100000000) * this.g.wallet.sat
+      }
+    }
+  }
+}

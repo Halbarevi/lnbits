@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Literal
+
+from fastapi import Query
+from lnurl import LnurlWithdrawResponse
+from loguru import logger
+from pydantic import BaseModel, Field, root_validator, validator
+
+from lnbits.db import FilterModel
+from lnbits.fiat.base import (
+    FiatPaymentStatus,
+)
+from lnbits.helpers import is_valid_external_id
+from lnbits.utils.bolt12 import looks_like_bolt12_offer
+from lnbits.utils.exchange_rates import allowed_currencies
+from lnbits.wallets.base import (
+    PaymentStatus,
+)
+
+
+class PaymentState(str, Enum):
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class PaymentExtra(BaseModel):
+    comment: str | None = None
+    success_action: str | None = None
+    lnurl_response: str | None = None
+
+
+class UpdatePaymentExtra(BaseModel):
+    payment_hash: str
+    extra: dict = Field(default_factory=dict)
+
+
+class ChangePaymentStatus(BaseModel):
+    wallet_id: str
+    checking_id: str
+    status: PaymentState
+    send_payment_notifications: bool = True
+    fee_msat: int = Field(default=0, ge=0)
+    preimage: str | None = Field(
+        default=None, min_length=64, max_length=64, regex=r"^[0-9a-fA-F]+$"
+    )
+
+
+class PayInvoice(BaseModel):
+    payment_request: str
+    description: str | None = None
+    max_sat: int | None = None
+    extra: dict | None = {}
+
+
+class ValidatedPaymentRequest(BaseModel):
+    """Validated payment data; offer payment hashes are provisional."""
+
+    payment_request: str
+    amount_msat: int
+    payment_hash: str
+    expiry_date: datetime | None
+    description: str
+    is_offer: bool
+
+
+class CreatePayment(BaseModel):
+    wallet_id: str
+    payment_hash: str
+    bolt11: str
+    amount_msat: int
+    memo: str
+    extra: dict | None = {}
+    extension: str | None = None
+    preimage: str | None = None
+    expiry: datetime | None = None
+    webhook: str | None = None
+    fee: int = 0
+    labels: list[str] | None = None
+    external_id: str | None = None
+
+    @validator("external_id")
+    def validate_external_id(cls, external_id):
+        return _validate_external_id(external_id)
+
+
+class Payment(BaseModel):
+    checking_id: str
+    payment_hash: str
+    wallet_id: str
+    amount: int
+    fee: int
+    bolt11: str
+    payment_request: str | None = Field(default=None, no_database=True)
+    fiat_provider: str | None = None
+    status: str = PaymentState.PENDING
+    memo: str | None = None
+    expiry: datetime | None = None
+    webhook: str | None = None
+    webhook_status: str | None = None
+    preimage: str | None = None
+    tag: str | None = None
+    extension: str | None = None
+    time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    labels: list[str] = []
+    extra: dict = {}
+    external_id: str | None = None
+
+    @validator("external_id")
+    def validate_external_id(cls, external_id):
+        return _validate_external_id(external_id)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if "fiat_payment_request" in self.extra:
+            self.payment_request = self.extra["fiat_payment_request"]
+        else:
+            self.payment_request = self.bolt11
+
+    @property
+    def pending(self) -> bool:
+        return self.status == PaymentState.PENDING.value
+
+    @property
+    def success(self) -> bool:
+        return self.status == PaymentState.SUCCESS.value
+
+    @property
+    def failed(self) -> bool:
+        return self.status == PaymentState.FAILED.value
+
+    @property
+    def msat(self) -> int:
+        return self.amount
+
+    @property
+    def sat(self) -> int:
+        return self.amount // 1000
+
+    @property
+    def is_in(self) -> bool:
+        return self.amount > 0
+
+    @property
+    def is_out(self) -> bool:
+        return self.amount < 0
+
+    @property
+    def is_expired(self) -> bool:
+        return self.expiry < datetime.now(timezone.utc) if self.expiry else False
+
+    @property
+    def is_internal(self) -> bool:
+        return self.checking_id.startswith("internal_") or self.checking_id.startswith(
+            "fiat_"
+        )
+
+    def can_change_status(self) -> bool:
+        return not (
+            not self.amount
+            or self.is_internal
+            or self.fiat_provider
+            or self.checking_id.startswith(("temp_", "service_fee_"))
+            or self.extra.get("internal")
+            or self.extra.get("tag") == "admin"
+            or self.extra.get("hold_invoice")
+            or looks_like_bolt12_offer(self.bolt11)
+        )
+
+    # DEPRECATED: in v1.5.0, use service check_payment_status instead
+    async def check_status(self) -> PaymentStatus:
+        logger.warning("payment.check_status() is deprecated.")
+        from lnbits.core.services.payments import check_payment_status
+
+        return await check_payment_status(self)
+
+    # DEPRECATED: in v1.5.0, use service check_payment_status instead
+    async def check_fiat_status(self) -> FiatPaymentStatus:
+        logger.warning("payment.check_fiat_status() is deprecated.")
+        from lnbits.core.services.fiat_providers import check_fiat_status
+
+        return await check_fiat_status(self)
+
+
+class PaymentFilters(FilterModel):
+    __search_fields__ = [
+        "memo",
+        "amount",
+        "wallet_id",
+        "tag",
+        "status",
+        "time",
+        "labels",
+        "external_id",
+    ]
+
+    __sort_fields__ = [
+        "created_at",
+        "updated_at",
+        "amount",
+        "fee",
+        "memo",
+        "time",
+        "tag",
+        "external_id",
+    ]
+
+    status: str | None
+    tag: str | None
+    checking_id: str | None
+    external_id: str | None
+    amount: int
+    fee: int
+    memo: str | None
+    time: datetime
+    preimage: str | None
+    payment_hash: str | None
+    wallet_id: str | None
+    labels: str | None
+
+
+class PaymentDataPoint(BaseModel):
+    date: datetime
+    count: int
+    max_amount: int
+    min_amount: int
+    average_amount: int
+    total_amount: int
+    max_fee: int
+    min_fee: int
+    average_fee: int
+    total_fee: int
+
+
+PaymentCountField = Literal["status", "tag", "extension", "wallet_id"]
+
+
+class PaymentCountStat(BaseModel):
+    field: str = ""
+    total: float = 0
+
+
+class PaymentWalletStats(BaseModel):
+    wallet_id: str = ""
+    wallet_name: str = ""
+    user_id: str = ""
+    payments_count: int
+    balance: float = 0
+
+
+class PaymentTotalBreakdown(BaseModel):
+    tag: str | None = None
+    is_fiat: bool = False
+    payments_count: int = 0
+    total: int = 0
+
+
+class PaymentDailyStats(BaseModel):
+    date: datetime
+    balance: float = 0
+    balance_in: float | None = 0
+    balance_out: float | None = 0
+    payments_count: int = 0
+    count_in: int | None = 0
+    count_out: int | None = 0
+    fee: float = 0
+
+
+class PaymentHistoryPoint(BaseModel):
+    date: datetime
+    income: int
+    spending: int
+    balance: int
+
+
+class DecodePayment(BaseModel):
+    data: str
+    filter_fields: list[str] | None = []
+
+
+class CreateInvoice(BaseModel):
+    unit: str = "sat"
+    internal: bool = False
+    out: bool = True
+    amount: float = Query(None, ge=0)
+    memo: str | None = Query(None, max_length=640)
+    description_hash: str | None = None
+    unhashed_description: str | None = None
+    payment_hash: str | None = Query(
+        None,
+        description="The payment hash of the hold invoice.",
+        min_length=64,
+        max_length=64,
+    )
+    expiry: int | None = None
+    extra: dict | None = None
+    extension: str | None = None
+    webhook: str | None = None
+    payment_request: str | None = Field(
+        default=None, description="The BOLT11 invoice or BOLT12 offer to pay."
+    )
+    bolt11: str | None = Field(
+        default=None,
+        description="Legacy input. Use payment_request instead.",
+        deprecated=True,
+    )
+    lnurl_withdraw: LnurlWithdrawResponse | None = None
+    fiat_provider: str | None = None
+    labels: list[str] = []
+    external_id: str | None = Query(default=None, max_length=256)
+
+    def is_fiat_subscription(self) -> bool:
+        return (self.extra or {}).get("fiat_method") == "subscription"
+
+    @validator("payment_hash")
+    def check_hex(cls, v):
+        if v:
+            _ = bytes.fromhex(v)
+        return v
+
+    @validator("unit")
+    @classmethod
+    def unit_is_from_allowed_currencies(cls, v):
+        if v != "sat" and v not in allowed_currencies():
+            raise ValueError("The provided unit is not supported")
+        return v
+
+    @validator("external_id")
+    def validate_external_id(cls, external_id):
+        return _validate_external_id(external_id)
+
+    @root_validator(pre=True)
+    def _normalize_payment_request(cls, values: dict) -> dict:
+        payment_request = values.get("payment_request")
+        bolt11 = values.get("bolt11")
+        if payment_request and bolt11 and payment_request != bolt11:
+            raise ValueError("payment_request and bolt11 must match.")
+        if not payment_request and bolt11:
+            values["payment_request"] = bolt11
+        return values
+
+
+class PaymentsStatusCount(BaseModel):
+    incoming: int = 0
+    outgoing: int = 0
+    failed: int = 0
+    pending: int = 0
+
+
+class SettleInvoice(BaseModel):
+    preimage: str = Field(
+        ...,
+        description="The preimage of the payment hash to settle the invoice.",
+        min_length=64,
+        max_length=64,
+    )
+
+    @validator("preimage")
+    def check_hex(cls, v):
+        _ = bytes.fromhex(v)
+        return v
+
+
+class CancelInvoice(BaseModel):
+    payment_hash: str = Field(
+        ...,
+        description="The payment hash of the invoice to cancel.",
+        min_length=64,
+        max_length=64,
+    )
+
+    @validator("payment_hash")
+    def check_hex(cls, v):
+        _ = bytes.fromhex(v)
+        return v
+
+
+class UpdatePaymentLabels(BaseModel):
+    labels: list[str] = []
+
+
+def _validate_external_id(external_id: str | None) -> str | None:
+    if external_id and not is_valid_external_id(external_id):
+        raise ValueError(
+            "Invalid external id. Max length is 256 characters. "
+            "Space and newlines are not allowed."
+        )
+    return external_id

@@ -1,0 +1,223 @@
+window._lnbitsApi = {
+  request(method, url, apiKey, data, options = {}) {
+    return axios({
+      method: method,
+      url: url,
+      headers: {
+        'X-Api-Key': apiKey
+      },
+      data: data,
+      ...options
+    })
+  },
+  getServerHealth() {
+    return this.request('get', '/api/v1/health')
+  },
+  async createInvoice(
+    wallet,
+    amount,
+    memo,
+    unit = 'sat',
+    lnurlWithdraw = null,
+    fiatProvider = null,
+    internalMemo = null,
+    payment_hash = null
+  ) {
+    const data = {
+      out: false,
+      amount: amount,
+      memo: memo,
+      unit: unit,
+      lnurl_withdraw: lnurlWithdraw,
+      fiat_provider: fiatProvider,
+      payment_hash: payment_hash
+    }
+    if (internalMemo) {
+      data.extra = {
+        internal_memo: String(internalMemo)
+      }
+    }
+    return this.request('post', '/api/v1/payments', wallet.inkey, data)
+  },
+  payInvoice(
+    wallet,
+    paymentRequest,
+    internalMemo = null,
+    amount = null,
+    memo = null
+  ) {
+    const data = {
+      out: true,
+      payment_request: paymentRequest
+    }
+    if (internalMemo) {
+      data.extra = {
+        internal_memo: String(internalMemo)
+      }
+    }
+    if (amount != null && amount !== '') {
+      data.amount = amount
+      data.unit = 'sat'
+    }
+    if (memo) {
+      data.memo = memo
+    }
+    return this.request('post', '/api/v1/payments', wallet.adminkey, data)
+  },
+  cancelInvoice(wallet, paymentHash) {
+    return this.request('post', '/api/v1/payments/cancel', wallet.adminkey, {
+      payment_hash: paymentHash
+    })
+  },
+  settleInvoice(wallet, preimage) {
+    return this.request('post', `/api/v1/payments/settle`, wallet.adminkey, {
+      preimage: preimage
+    })
+  },
+  createAccount(name) {
+    return this.request('post', '/api/v1/account', null, {
+      name: name
+    })
+  },
+  register(username, email, password, password_repeat, invitation_code) {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/auth/register',
+      data: {
+        username,
+        email,
+        password,
+        password_repeat,
+        invitation_code
+      }
+    })
+  },
+  reset(reset_key, password, password_repeat) {
+    return axios({
+      method: 'PUT',
+      url: '/api/v1/auth/reset',
+      data: {
+        reset_key,
+        password,
+        password_repeat
+      }
+    })
+  },
+  getAuthUser() {
+    return axios({
+      method: 'GET',
+      url: '/api/v1/auth'
+    })
+  },
+  login(username, password) {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/auth',
+      data: {username, password}
+    })
+  },
+  loginByProvider(provider, headers, data) {
+    return axios({
+      method: 'POST',
+      url: `/api/v1/auth/${provider}`,
+      headers: headers,
+      data
+    })
+  },
+  loginUsr(usr) {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/auth/usr',
+      data: {usr}
+    })
+  },
+  logout() {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/auth/logout'
+    })
+  },
+  impersonateUser(usr) {
+    return axios({
+      method: 'POST',
+      url: '/api/v1/auth/impersonate',
+      data: {usr}
+    })
+  },
+  stopImpersonation() {
+    return axios({
+      method: 'DELETE',
+      url: '/api/v1/auth/impersonate'
+    })
+  },
+  getAuthenticatedUser() {
+    return this.request('get', '/api/v1/auth')
+  },
+  getWallet(wallet) {
+    return this.request('get', '/api/v1/wallet', wallet.inkey)
+  },
+  createWallet(name, walletType, opts = {}) {
+    return this.request('post', '/api/v1/wallet', null, {
+      name: name,
+      wallet_type: walletType,
+      ...opts
+    })
+  },
+  updateWallet(name, wallet) {
+    return this.request('patch', '/api/v1/wallet', wallet.adminkey, {
+      name: name
+    })
+  },
+  updateUiCustomization(data = {}) {
+    return this.request('patch', '/api/v1/auth/ui', null, data)
+  },
+  resetWalletKeys(wallet) {
+    return this.request('put', `/api/v1/wallet/reset/${wallet.id}`).then(
+      res => {
+        return res.data
+      }
+    )
+  },
+  deleteWallet(wallet) {
+    return this.request('delete', `/api/v1/wallet/${wallet.id}`)
+  },
+  getPayments(wallet, params) {
+    return this.request(
+      'get',
+      '/api/v1/payments/paginated?' + params,
+      wallet.inkey
+    )
+  },
+  getPaymentTotalBreakdown(wallet) {
+    return this.request('get', '/api/v1/payments/stats/breakdown', wallet.inkey)
+  },
+  getPayment(wallet, paymentHash) {
+    return this.request('get', '/api/v1/payments/' + paymentHash, wallet.inkey)
+  },
+  updateBalance(credit, wallet_id, memo = null) {
+    return this.request('PUT', '/users/api/v1/balance', null, {
+      amount: credit,
+      id: wallet_id,
+      memo: memo
+    })
+  },
+  getCurrencies() {
+    return this.request('GET', '/api/v1/currencies').then(response => {
+      return ['sats', ...response.data]
+    })
+  },
+  getDefaultSetting(fieldName) {
+    return LNbits.api
+      .request('GET', `/admin/api/v1/settings/default?field_name=${fieldName}`)
+      .catch(LNbits.utils.notifyApiError)
+  },
+  getBlockexplorerAddress(address) {
+    return this.request('get', `/blockexplorer/api/v1/address/${address}`)
+  },
+  getBlockexplorerTransaction(txid) {
+    return this.request('get', `/blockexplorer/api/v1/tx/${txid}`)
+  },
+  getBlockexplorerUtxos(address) {
+    return this.request('get', `/blockexplorer/api/v1/utxos/${address}`)
+  }
+}

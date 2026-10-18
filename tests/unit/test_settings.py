@@ -1,0 +1,485 @@
+from pathlib import Path
+from typing import Any, Literal
+from uuid import UUID
+
+import pytest
+from pytest_mock.plugin import MockerFixture
+
+from lnbits.settings import (
+    DEFAULT_WASM_MANIFESTS,
+    AssetSettings,
+    ExchangeRateProvider,
+    InstalledExtensionsSettings,
+    NotificationsSettings,
+    PublicSettings,
+    RedirectPath,
+    SecuritySettings,
+    Settings,
+    UsersSettings,
+    list_parse_fallback,
+    set_cli_settings,
+)
+
+lnurlp_redirect_path: dict[str, Any] = {
+    "from_path": "/.well-known/lnurlp",
+    "redirect_to_path": "/api/v1/well-known",
+}
+lnurlp_redirect_path_with_headers: dict[str, Any] = {
+    "from_path": "/.well-known/lnurlp",
+    "redirect_to_path": "/api/v1/well-known",
+    "header_filters": {"accept": "application/nostr+json"},
+}
+
+lnaddress_redirect_path: dict[str, Any] = {
+    "from_path": "/.well-known/lnurlp",
+    "redirect_to_path": "/api/v1/well-known",
+}
+
+nostrrelay_redirect_path: dict[str, Any] = {
+    "from_path": "/",
+    "redirect_to_path": "/api/v1/relay-info",
+    "header_filters": {"accept": "application/nostr+json"},
+}
+
+
+@pytest.mark.parametrize(
+    ("mode", "creation_allowed"),
+    [
+        ("core_first", True),
+        ("extension_first", True),
+        ("extension_only", False),
+    ],
+)
+def test_ln_address_mode(
+    mode: Literal["core_first", "extension_first", "extension_only"],
+    creation_allowed: bool,
+):
+    users_settings = UsersSettings(lnbits_ln_address_mode=mode)
+
+    assert users_settings.lnbits_ln_address_mode == mode
+    assert users_settings.ln_address_creation_allowed is creation_allowed
+
+
+def test_ln_address_mode_defaults_to_extension_first():
+    assert UsersSettings().lnbits_ln_address_mode == "extension_first"
+
+
+def test_ln_address_mode_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        UsersSettings.parse_obj({"lnbits_ln_address_mode": "invalid"})
+
+
+@pytest.fixture()
+def lnurlp():
+    return RedirectPath(ext_id="lnurlp", **lnurlp_redirect_path)
+
+
+@pytest.fixture()
+def lnurlp_with_headers():
+    return RedirectPath(
+        ext_id="lnurlp_with_headers", **lnurlp_redirect_path_with_headers
+    )
+
+
+@pytest.fixture()
+def lnaddress():
+    return RedirectPath(ext_id="lnaddress", **lnaddress_redirect_path)
+
+
+@pytest.fixture()
+def nostrrelay():
+    return RedirectPath(ext_id="nostrrelay", **nostrrelay_redirect_path)
+
+
+def test_redirect_path_self_not_in_conflict(
+    lnurlp: RedirectPath, lnaddress: RedirectPath, nostrrelay: RedirectPath
+):
+    assert not lnurlp.in_conflict(lnurlp), "Path is not in conflict with itself."
+    assert not lnaddress.in_conflict(lnaddress), "Path is not in conflict with itself."
+    assert not nostrrelay.in_conflict(
+        nostrrelay
+    ), "Path is not in conflict with itself."
+
+    assert not lnurlp.in_conflict(nostrrelay)
+
+    assert not nostrrelay.in_conflict(lnurlp)
+
+
+def test_redirect_path_not_in_conflict(
+    lnurlp: RedirectPath, lnaddress: RedirectPath, nostrrelay: RedirectPath
+):
+
+    assert not lnurlp.in_conflict(nostrrelay)
+
+    assert not nostrrelay.in_conflict(lnurlp)
+
+    assert not lnaddress.in_conflict(nostrrelay)
+
+    assert not nostrrelay.in_conflict(lnaddress)
+
+
+def test_redirect_path_in_conflict(lnurlp: RedirectPath, lnaddress: RedirectPath):
+    assert lnurlp.in_conflict(lnaddress)
+    assert lnaddress.in_conflict(lnurlp)
+
+
+def test_redirect_path_find_conflict(
+    lnurlp: RedirectPath, lnaddress: RedirectPath, nostrrelay: RedirectPath
+):
+    assert lnurlp.find_in_conflict([nostrrelay, lnaddress])
+    assert lnurlp.find_in_conflict([lnaddress, nostrrelay])
+    assert lnaddress.find_in_conflict([nostrrelay, lnurlp])
+    assert lnaddress.find_in_conflict([lnurlp, nostrrelay])
+
+
+def test_redirect_path_find_no_conflict(
+    lnurlp: RedirectPath, lnaddress: RedirectPath, nostrrelay: RedirectPath
+):
+    assert not nostrrelay.find_in_conflict([lnurlp, lnaddress])
+    assert not lnurlp.find_in_conflict([nostrrelay])
+    assert not lnaddress.find_in_conflict([nostrrelay])
+
+
+def test_redirect_path_in_conflict_with_headers(
+    lnurlp: RedirectPath, lnurlp_with_headers: RedirectPath
+):
+    assert lnurlp.in_conflict(lnurlp_with_headers)
+    assert lnurlp_with_headers.in_conflict(lnurlp)
+
+
+def test_redirect_path_matches_with_headers(
+    lnurlp: RedirectPath, lnurlp_with_headers: RedirectPath
+):
+    headers_list = list(lnurlp_with_headers.header_filters.items())
+    assert lnurlp.redirect_matches(
+        path=lnurlp_with_headers.from_path,
+        req_headers=headers_list,
+    )
+    assert lnurlp_with_headers.redirect_matches(
+        path=lnurlp_redirect_path["from_path"],
+        req_headers=[("ACCEPT", "APPlication/nostr+json")],
+    )
+    assert lnurlp_with_headers.redirect_matches(
+        path=lnurlp_redirect_path["from_path"],
+        req_headers=[("accept", "application/nostr+json"), ("my_header", "my_value")],
+    )
+
+    assert not lnurlp_with_headers.redirect_matches(
+        path=lnurlp_redirect_path["from_path"], req_headers=[]
+    )
+    assert not lnurlp_with_headers.redirect_matches(
+        path=lnurlp_redirect_path["from_path"],
+        req_headers=[("accept", "application/json")],
+    )
+    assert not lnurlp_with_headers.redirect_matches(path="/random/path", req_headers=[])
+    assert not lnurlp_with_headers.redirect_matches(path="/random_path", req_headers=[])
+    assert not lnurlp_with_headers.redirect_matches(
+        path="/.well-known/lnurlp", req_headers=[]
+    )
+    assert lnurlp.redirect_matches(path="/.well-known/lnurlp", req_headers=[])
+    assert lnurlp.redirect_matches(
+        path="/.well-known/lnurlp/some/other/path", req_headers=[]
+    )
+    assert lnurlp.redirect_matches(
+        path="/.well-known/lnurlp/some/other/path",
+        req_headers=headers_list,
+    )
+    assert not lnurlp_with_headers.redirect_matches(
+        path="/.well-known/lnurlp", req_headers=[]
+    )
+    assert not lnurlp_with_headers.redirect_matches(
+        path="/.well-known/lnurlp/some/other/path", req_headers=[]
+    )
+    assert lnurlp_with_headers.redirect_matches(
+        path="/.well-known/lnurlp/some/other/path",
+        req_headers=headers_list,
+    )
+
+
+def test_redirect_path_new_path_from(lnurlp: RedirectPath):
+    assert lnurlp.new_path_from("") == "/lnurlp/api/v1/well-known"
+    assert lnurlp.new_path_from("/") == "/lnurlp/api/v1/well-known"
+    assert lnurlp.new_path_from("/path") == "/lnurlp/api/v1/well-known"
+    assert lnurlp.new_path_from("/path/more") == "/lnurlp/api/v1/well-known"
+
+    assert lnurlp.new_path_from("/.well-known/lnurlp") == "/lnurlp/api/v1/well-known"
+    assert (
+        lnurlp.new_path_from("/.well-known/lnurlp/path")
+        == "/lnurlp/api/v1/well-known/path"
+    )
+    assert (
+        lnurlp.new_path_from("/.well-known/lnurlp/path/more")
+        == "/lnurlp/api/v1/well-known/path/more"
+    )
+
+
+def test_list_parse_fallback():
+    assert list_parse_fallback("a, b, c") == ["a", "b", "c"]
+    assert list_parse_fallback('["a", "b"]') == ["a", "b"]
+    assert list_parse_fallback("") == []
+
+
+def test_settings_keep_wasm_manifests_separate_from_extension_manifests():
+    settings = Settings(
+        lnbits_extensions_manifests=["https://example.com/extensions.json"],
+        lnbits_wasm_extensions_manifests=[
+            *DEFAULT_WASM_MANIFESTS,
+            "https://example.com/extensions.json",
+        ],
+    )
+
+    assert settings.lnbits_extensions_manifests == [
+        "https://example.com/extensions.json"
+    ]
+    assert settings.lnbits_wasm_extensions_manifests == [
+        *DEFAULT_WASM_MANIFESTS,
+        "https://example.com/extensions.json",
+    ]
+    assert settings.dict()["lnbits_extensions_manifests"] == [
+        "https://example.com/extensions.json"
+    ]
+    assert settings.dict()["lnbits_wasm_extensions_manifests"] == [
+        *DEFAULT_WASM_MANIFESTS,
+        "https://example.com/extensions.json",
+    ]
+
+
+def test_wasm_extensions_directory_defaults_to_data_folder_and_is_configurable(
+    tmp_path: Path,
+):
+    data_folder = tmp_path / "data"
+    default_settings = Settings(
+        lnbits_data_folder=str(data_folder),
+        lnbits_wasm_extensions_path="",
+    )
+    custom_path = tmp_path / "custom-wasm"
+    custom_settings = Settings(
+        lnbits_data_folder=str(data_folder),
+        lnbits_wasm_extensions_path=str(custom_path),
+    )
+
+    assert default_settings.wasm_extensions_dir == data_folder / "wasm_extensions"
+    assert default_settings.lnbits_wasm_extensions_path == str(
+        data_folder / "wasm_extensions"
+    )
+    assert custom_settings.wasm_extensions_dir == custom_path
+
+
+def test_wasm_extensions_directory_must_not_be_importable(tmp_path: Path):
+    settings = Settings(
+        lnbits_data_folder=str(tmp_path / "data"),
+        lnbits_extensions_path=str(tmp_path / "code"),
+        lnbits_wasm_extensions_path=str(
+            tmp_path / "code" / "extensions" / "wasm_extensions"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="outside importable extension directories"):
+        _ = settings.wasm_extensions_dir
+
+
+def test_exchange_rate_provider_convert_ticker():
+    provider = ExchangeRateProvider(
+        name="Provider",
+        api_url="https://example.com",
+        path="$.price",
+        ticker_conversion=["USD:USDT"],
+    )
+    invalid_provider = ExchangeRateProvider(
+        name="Invalid",
+        api_url="https://example.com",
+        path="$.price",
+        ticker_conversion=["invalid"],
+    )
+
+    assert provider.convert_ticker("USD") == "USDT"
+    assert provider.convert_ticker("EUR") == "EUR"
+    assert invalid_provider.convert_ticker("USD") == "USD"
+
+
+def test_installed_extensions_settings_activate_and_deactivate_paths():
+    installed = InstalledExtensionsSettings()
+    redirects = [
+        {
+            "from_path": "/.well-known/lnurlp",
+            "redirect_to_path": "/api/v1/well-known",
+        }
+    ]
+
+    installed.activate_extension_paths("lnurlp", ext_redirects=redirects)
+
+    redirect = installed.find_extension_redirect("/.well-known/lnurlp", [])
+    assert redirect is not None
+    assert redirect.ext_id == "lnurlp"
+    assert "lnurlp" in installed.lnbits_installed_extensions_ids
+
+    installed.deactivate_extension_paths("lnurlp")
+
+    assert "lnurlp" in installed.lnbits_deactivated_extensions
+    assert installed.find_extension_redirect("/.well-known/lnurlp", []) is None
+
+
+def test_public_settings_include_burger_menu_background(settings: Settings):
+    settings.lnbits_default_burger_menu_background = False
+    settings.lnbits_blockexplorer_public_api = True
+    settings.lnbits_blockexplorer_in_user_menu = True
+
+    public_settings = PublicSettings.from_settings(settings)
+
+    assert public_settings.default_burger_menu_background is False
+    assert public_settings.block_explorer_public is True
+    assert public_settings.block_explorer_in_user_menu is True
+
+
+def test_installed_extensions_settings_detects_conflicting_redirects():
+    installed = InstalledExtensionsSettings(
+        lnbits_extensions_redirects=[
+            RedirectPath(
+                ext_id="ext_a",
+                from_path="/.well-known/lnurlp",
+                redirect_to_path="/api/v1/well-known",
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Cannot redirect for extension 'ext_b'"):
+        installed.activate_extension_paths(
+            "ext_b",
+            ext_redirects=[
+                {
+                    "from_path": "/.well-known/lnurlp",
+                    "redirect_to_path": "/api/v1/well-known",
+                }
+            ],
+        )
+
+
+def test_settings_helper_methods(settings: Settings, mocker: MockerFixture):
+    mocker.patch.object(settings, "super_user", "super-user")
+    mocker.patch.object(settings, "lnbits_admin_users", ["admin-user"])
+    mocker.patch.object(settings, "lnbits_allowed_users", ["allowed-user"])
+    mocker.patch.object(settings, "lnbits_installed_extensions_ids", {"installed"})
+    mocker.patch.object(settings, "lnbits_all_extensions_ids", {"installed", "new"})
+
+    assert settings.is_user_allowed("allowed-user") is True
+    assert settings.is_user_allowed("admin-user") is True
+    assert settings.is_user_allowed("super-user") is True
+    assert settings.is_user_allowed("random-user") is False
+    assert settings.is_super_user("super-user") is True
+    assert settings.is_admin_user("admin-user") is True
+    assert settings.is_installed_extension_id("installed") is True
+    assert settings.is_ready_to_install_extension_id("new") is True
+    assert settings.is_ready_to_install_extension_id("installed") is False
+
+
+def test_asset_security_and_notification_helpers(
+    settings: Settings, mocker: MockerFixture
+):
+    mocker.patch.object(settings, "super_user", "super-user")
+    mocker.patch.object(settings, "lnbits_admin_users", ["admin-user"])
+
+    asset_settings = AssetSettings(lnbits_assets_no_limit_users=["vip-user"])
+    security_settings = SecuritySettings(lnbits_wallet_limit_max_balance=100)
+    notification_settings = NotificationsSettings(
+        lnbits_nostr_notifications_enabled=True,
+        lnbits_nostr_notifications_private_key="nostr-key",
+        lnbits_telegram_notifications_enabled=True,
+        lnbits_telegram_notifications_access_token="telegram-token",
+    )
+
+    assert asset_settings.is_unlimited_assets_user("admin-user") is True
+    assert asset_settings.is_unlimited_assets_user("vip-user") is True
+    assert asset_settings.is_unlimited_assets_user("random-user") is False
+    assert security_settings.is_wallet_max_balance_exceeded(101) is True
+    assert security_settings.is_wallet_max_balance_exceeded(100) is False
+    assert security_settings.lnbits_callback_allow_private_ips is False
+    assert security_settings.lnbits_lnurl_redirect_url_rules == []
+    assert security_settings.lnbits_lnurl_allow_private_ips is False
+    assert notification_settings.is_nostr_notifications_configured() is True
+    assert notification_settings.is_telegram_notifications_configured() is True
+
+
+def test_public_settings_from_settings(settings: Settings):
+    original_site_title = settings.lnbits_site_title
+    original_ad_space = settings.lnbits_ad_space
+    original_ad_space_enabled = settings.lnbits_ad_space_enabled
+    original_installed_extensions = settings.lnbits_installed_extensions_ids
+    original_first_install_token = settings.first_install_token
+    try:
+        settings.lnbits_site_title = "Test LNbits"
+        settings.lnbits_ad_space = "https://example.com;/banner.png;/thumb.png"
+        settings.lnbits_ad_space_enabled = True
+        settings.lnbits_installed_extensions_ids = {"ext_a"}
+        settings.first_install_token = "token"
+
+        public = PublicSettings.from_settings(settings)
+
+        assert public.site_title == "Test LNbits"
+        assert public.show_ad_space is True
+        assert public.ad_space == [["https://example.com", "/banner.png", "/thumb.png"]]
+        assert set(public.extensions) == {"ext_a"}
+        assert public.has_first_install_token is True
+    finally:
+        settings.lnbits_site_title = original_site_title
+        settings.lnbits_ad_space = original_ad_space
+        settings.lnbits_ad_space_enabled = original_ad_space_enabled
+        settings.lnbits_installed_extensions_ids = original_installed_extensions
+        settings.first_install_token = original_first_install_token
+
+
+def test_set_cli_settings_updates_runtime_settings(settings: Settings):
+    original_host = settings.host
+    try:
+        set_cli_settings(host="0.0.0.0")  # noqa S104
+        assert settings.host == "0.0.0.0"  # noqa S104
+    finally:
+        settings.host = original_host
+
+
+@pytest.mark.parametrize(
+    "field,filename",
+    [
+        ("auth_secret_key", ".lnbits_auth_key"),
+        ("totp_encryption_key", ".lnbits_totp_key"),
+    ],
+)
+def test_secret_key_file_lifecycle(settings, tmp_path, monkeypatch, field, filename):
+    data_folder = tmp_path / "data"
+    monkeypatch.setattr(settings, "lnbits_data_folder", str(data_folder))
+    monkeypatch.setattr(settings, field, "")
+    initialize = getattr(settings, f"check_{field}")
+    initialize()
+    generated = getattr(settings, field)
+    assert len(generated) == 32
+    assert UUID(hex=generated).version == 4
+    key_file = data_folder / filename
+    assert key_file.read_text() == generated
+
+    setattr(settings, field, "")
+    initialize()
+    assert getattr(settings, field) == generated
+
+    key_file.unlink()
+    setattr(settings, field, "")
+    initialize()
+    assert getattr(settings, field) != generated
+    assert key_file.read_text() == getattr(settings, field)
+
+
+@pytest.mark.parametrize(
+    "field,filename",
+    [
+        ("auth_secret_key", ".lnbits_auth_key"),
+        ("totp_encryption_key", ".lnbits_totp_key"),
+    ],
+)
+def test_configured_secret_key_takes_precedence(
+    settings, tmp_path, monkeypatch, field, filename
+):
+    monkeypatch.setattr(settings, "lnbits_data_folder", str(tmp_path))
+    monkeypatch.setattr(settings, field, "ab" * 32)
+    key_file = tmp_path / filename
+    key_file.write_text("cd" * 16)
+    getattr(settings, f"check_{field}")()
+    assert getattr(settings, field) == "ab" * 32
+    assert key_file.read_text() == "cd" * 16

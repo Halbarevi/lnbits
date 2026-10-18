@@ -1,0 +1,1422 @@
+import asyncio
+import hashlib
+import ipaddress
+import json
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+import shortuuid
+from pytest_mock.plugin import MockerFixture
+
+from lnbits import bolt11
+from lnbits.core.crud.payments import create_payment, get_standalone_payment
+from lnbits.core.models import CreateInvoice, CreatePayment, Payment, PaymentState
+from lnbits.core.models.users import Account, UserExtra, UserLabel
+from lnbits.core.services.users import create_user_account
+from lnbits.core.views.payment_api import api_payment
+from lnbits.fiat.base import FiatInvoiceResponse
+from lnbits.settings import Settings
+from lnbits.utils.crypto import random_secret_and_hash
+from lnbits.wallets.base import PaymentResponse
+from lnbits.wallets.fake import FakeWallet
+
+from ..helpers import (
+    BOLT12_OFFER,
+    BOLT12_OFFER_WITH_AMOUNT,
+    BOLT12_OFFER_WITH_CURRENCY,
+    BOLT12_OFFER_WITH_DESCRIPTION,
+    get_random_invoice_data,
+    get_random_string,
+)
+
+
+# create account POST /api/v1/account
+@pytest.mark.anyio
+async def test_create_account(client, settings: Settings):
+    settings.lnbits_allow_new_accounts = False
+    response = await client.post("/api/v1/account", json={"name": "test"})
+
+    assert response.status_code == 400
+    assert response.json().get("detail") == "Account creation is disabled."
+
+    settings.lnbits_allow_new_accounts = True
+    response = await client.post("/api/v1/account", json={"name": "test"})
+    assert response.status_code == 200
+    result = response.json()
+    assert "name" in result
+    assert result["name"] == "test"
+    assert "balance_msat" in result
+    assert "id" in result
+    assert "user" in result
+
+
+# check POST and DELETE /api/v1/wallet with adminkey and user token:
+# create additional wallet and delete it
+@pytest.mark.anyio
+async def test_create_wallet_and_delete(client, user_headers_from):
+    tiny_id = shortuuid.uuid()[:8]
+    response = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "username": f"u21.{tiny_id}",
+            "password": "secret1234",
+            "password_repeat": "secret1234",
+            "email": f"u21.{tiny_id}@lnbits.com",
+        },
+    )
+
+    client.cookies.clear()
+
+    access_token = response.json().get("access_token")
+    assert response.status_code == 200, "User created."
+    assert response.json().get("access_token") is not None
+
+    response = await client.post(
+        "/api/v1/wallet",
+        json={"name": "test"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert "name" in result
+    assert result["name"] == "test"
+    assert "balance_msat" in result
+    assert "id" in result
+    assert "adminkey" in result
+
+    # should not work with admin key only with user
+    invalid_response = await client.delete(
+        f"/api/v1/wallet/{result['id']}",
+        headers={
+            "X-Api-Key": result["adminkey"],
+            "Content-type": "application/json",
+        },
+    )
+    assert invalid_response.status_code == 401
+
+    response = await client.delete(
+        f"/api/v1/wallet/{result['id']}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == 200
+
+    # get deleted wallet
+    response = await client.get(
+        "/api/v1/wallet",
+        headers={
+            "X-Api-Key": result["adminkey"],
+            "Content-type": "application/json",
+        },
+    )
+    assert response.status_code == 404
+
+
+# check GET /api/v1/wallet with inkey: wallet info, no balance
+@pytest.mark.anyio
+async def test_get_wallet_inkey(client, inkey_headers_to):
+    response = await client.get("/api/v1/wallet", headers=inkey_headers_to)
+    assert response.status_code == 200
+    result = response.json()
+    assert "name" in result
+    assert "balance" in result
+    assert "id" not in result
+
+
+# check GET /api/v1/wallet with adminkey: wallet info with balance
+@pytest.mark.anyio
+async def test_get_wallet_adminkey(client, adminkey_headers_to):
+    response = await client.get("/api/v1/wallet", headers=adminkey_headers_to)
+    assert response.status_code == 200
+    result = response.json()
+    assert "name" in result
+    assert "balance" in result
+    assert "id" in result
+
+
+# check PUT /api/v1/wallet/newwallet: empty request where admin key is needed
+@pytest.mark.anyio
+async def test_put_empty_request_expected_admin_keys(client):
+    response = await client.put("/api/v1/wallet/newwallet")
+    assert response.status_code == 401
+
+
+# check POST /api/v1/payments: empty request where invoice key is needed
+@pytest.mark.anyio
+async def test_post_empty_request_expected_invoice_keys(client):
+    response = await client.post("/api/v1/payments")
+    assert response.status_code == 401
+
+
+# check POST /api/v1/payments: invoice creation
+@pytest.mark.anyio
+async def test_create_invoice(client, inkey_headers_to):
+    data = await get_random_invoice_data()
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    assert response.status_code == 201
+    invoice = response.json()
+    assert "payment_hash" in invoice
+    assert len(invoice["payment_hash"]) == 64
+    assert "bolt11" in invoice
+    assert "checking_id" in invoice
+    assert len(invoice["checking_id"])
+    return invoice
+
+
+@pytest.mark.anyio
+async def test_create_invoice_fiat_amount(client, inkey_headers_to):
+    data = await get_random_invoice_data()
+    data["unit"] = "EUR"
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    assert response.status_code == 201
+    invoice = response.json()
+    decode = bolt11.decode(invoice["bolt11"])
+    assert decode.amount_msat != data["amount"] * 1000
+    assert decode.payment_hash
+
+    response = await client.get(
+        f"/api/v1/payments/{decode.payment_hash}", headers=inkey_headers_to
+    )
+    assert response.is_success
+    res_data = response.json()
+    extra = res_data["details"]["extra"]
+    assert extra["fiat_amount"] == data["amount"]
+    assert extra["fiat_currency"] == data["unit"]
+    assert extra["fiat_rate"]
+
+
+@pytest.mark.anyio
+async def test_create_fiat_invoice(
+    client, inkey_headers_to, settings: Settings, mocker: MockerFixture
+):
+    data = await get_random_invoice_data()
+    data["unit"] = "EUR"
+    data["fiat_provider"] = "stripe"
+
+    settings.stripe_enabled = True
+    settings.stripe_api_secret_key = "mock_sk_test_4eC39HqLyjWDarjtT1zdp7dc"
+
+    fiat_payment_request = "https://stripe.com/pay/session_123"
+    fiat_mock_response = FiatInvoiceResponse(
+        ok=True,
+        checking_id=f"session_123_{get_random_string(10)}",
+        payment_request=fiat_payment_request,
+    )
+
+    mocker.patch(
+        "lnbits.fiat.StripeWallet.create_invoice",
+        AsyncMock(return_value=fiat_mock_response),
+    )
+    mocker.patch(
+        "lnbits.utils.exchange_rates.get_fiat_rate_satoshis",
+        AsyncMock(return_value=1000),  # 1 BTC = 100 000 EUR, so 1 EUR = 1000 sats
+    )
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    assert response.status_code == 201
+    invoice = response.json()
+    decode = bolt11.decode(invoice["bolt11"])
+    assert decode.amount_msat == 10_000_000
+    assert decode.payment_hash
+    assert invoice["fiat_provider"] == "stripe"
+    assert invoice["status"] == "pending"
+    assert invoice["extra"]["fiat_checking_id"]
+    assert invoice["extra"]["fiat_payment_request"] == fiat_payment_request
+
+    response = await client.get(
+        f"/api/v1/payments/{decode.payment_hash}", headers=inkey_headers_to
+    )
+    assert response.is_success
+    data = response.json()
+    assert data["status"] == "pending"
+    invoice = data["details"]
+
+    assert invoice["fiat_provider"] == "stripe"
+    assert invoice["status"] == "pending"
+    assert invoice["amount"] == 10_000_000
+    assert invoice["extra"]["fiat_checking_id"]
+    assert invoice["extra"]["fiat_payment_request"] == fiat_payment_request
+
+
+@pytest.mark.anyio
+async def test_create_fiat_invoice_with_lnurl_withdraw_rejected(
+    client, inkey_headers_to
+):
+    response = await client.post(
+        "/api/v1/payments",
+        headers=inkey_headers_to,
+        json={
+            "unit": "USD",
+            "out": False,
+            "amount": 1,
+            "fiat_provider": "stripe",
+            "lnurl_withdraw": {
+                "tag": "withdrawRequest",
+                "callback": "https://example.com/callback",
+                "k1": "randomk1value",
+                "minWithdrawable": 1000,
+                "maxWithdrawable": 1_500_000,
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Fiat provider cannot be combined with LNURL withdraw."
+    )
+
+
+@pytest.mark.anyio
+async def test_create_fiat_subscription_invoice_rejected(
+    client, inkey_headers_to, mocker: MockerFixture
+):
+    fiat_mock = mocker.patch(
+        "lnbits.core.services.payments.create_fiat_invoice",
+        AsyncMock(),
+    )
+
+    response = await client.post(
+        "/api/v1/payments",
+        headers=inkey_headers_to,
+        json={
+            "unit": "USD",
+            "out": False,
+            "amount": 2100,
+            "fiat_provider": "stripe",
+            "extra": {
+                "fiat_method": "subscription",
+                "subscription": {
+                    "checking_id": "fiat_stripe_cs_paid_session",
+                    "payment_request": "",
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Cannot create direct fiat subscription payments."
+    )
+    fiat_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("currency", ("msat", "RRR"))
+async def test_create_invoice_validates_used_currency(
+    currency, client, inkey_headers_to
+):
+    data = await get_random_invoice_data()
+    data["unit"] = currency
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    assert response.status_code == 400
+    res_data = response.json()
+    assert "The provided unit is not supported" in res_data["detail"][0]["msg"]
+
+
+# check POST /api/v1/payments: invoice creation for internal payments only
+@pytest.mark.anyio
+async def test_create_internal_invoice(client, inkey_headers_to):
+    data = await get_random_invoice_data()
+    data["internal"] = True
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    invoice = response.json()
+    assert response.status_code == 201
+    assert "payment_hash" in invoice
+    assert len(invoice["payment_hash"]) == 64
+    assert "bolt11" in invoice
+    assert "checking_id" in invoice
+    assert len(invoice["checking_id"])
+    return invoice
+
+
+# check POST /api/v1/payments: invoice with custom expiry
+@pytest.mark.anyio
+async def test_create_invoice_custom_expiry(client, inkey_headers_to):
+    data = await get_random_invoice_data()
+    expiry_seconds = 600 * 6 * 24 * 31  # 31 days in the future
+    data["expiry"] = expiry_seconds
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    assert response.status_code == 201
+    invoice = response.json()
+    bolt11_invoice = bolt11.decode(invoice["bolt11"])
+    assert bolt11_invoice.expiry == expiry_seconds
+
+
+# check POST /api/v1/payments: make payment
+@pytest.mark.anyio
+async def test_pay_invoice(
+    client, from_wallet_ws, invoice: Payment, adminkey_headers_from
+):
+    data = {"out": True, "bolt11": invoice.bolt11}
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=adminkey_headers_from
+    )
+    assert response.status_code < 300
+    invoice_ = response.json()
+    assert len(invoice_["payment_hash"]) == 64
+    assert len(invoice_["checking_id"]) > 0
+
+    ws_data = from_wallet_ws.receive_json()
+    assert "wallet_balance" in ws_data
+    payment = Payment(**ws_data["payment"])
+    assert payment.payment_hash == invoice_["payment_hash"]
+
+    # websocket from to_wallet cant be tested before https://github.com/lnbits/lnbits/pull/1793
+    # data = to_wallet_ws.receive_json()
+    # assert "wallet_balance" in data
+    # payment = Payment(**data["payment"])
+    # assert payment.payment_hash == invoice["payment_hash"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("include_legacy", [False, True])
+@pytest.mark.parametrize("memo", [None, "BOLT11 memo"])
+async def test_pay_invoice_with_payment_request(
+    client, inkey_headers_to, adminkey_headers_from, include_legacy, memo
+):
+    created = await client.post(
+        "/api/v1/payments",
+        json={"out": False, "amount": 21, "memo": "payment_request test"},
+        headers=inkey_headers_to,
+    )
+    assert created.status_code == 201
+    invoice = created.json()
+    data = {"out": True, "payment_request": invoice["bolt11"]}
+    if include_legacy:
+        data["bolt11"] = invoice["bolt11"]
+    if memo is not None:
+        data["memo"] = memo
+
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=adminkey_headers_from
+    )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "success"
+    assert response.json()["payment_hash"] == invoice["payment_hash"]
+    assert response.json()["amount"] == -21_000
+    assert response.json()["memo"] == (memo or "payment_request test")
+    assert "payer_note" not in response.json()["extra"]
+
+
+@pytest.mark.anyio
+async def test_pay_invoice_rejects_conflicting_payment_requests(
+    client, adminkey_headers_from, mocker
+):
+    pay_invoice = mocker.patch(
+        "lnbits.core.views.payment_api.pay_invoice", new_callable=AsyncMock
+    )
+    pay_offer = mocker.patch(
+        "lnbits.core.views.payment_api.pay_offer", new_callable=AsyncMock
+    )
+    response = await client.post(
+        "/api/v1/payments",
+        json={
+            "out": True,
+            "payment_request": "lno1offer",
+            "bolt11": "lnbc1invoice",
+            "amount": 21,
+        },
+        headers=adminkey_headers_from,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"][0]["msg"] == (
+        "payment_request and bolt11 must match."
+    )
+    pay_invoice.assert_not_awaited()
+    pay_offer.assert_not_awaited()
+
+
+# check POST /api/v1/payments: the webhook is kept on an outgoing payment
+@pytest.mark.anyio
+@pytest.mark.parametrize("request_field", ["bolt11", "payment_request"])
+@pytest.mark.parametrize("is_offer", [False, True])
+async def test_pay_invoice_with_webhook(
+    client,
+    inkey_headers_to,
+    adminkey_headers_from,
+    mocker: MockerFixture,
+    request_field,
+    is_offer,
+):
+    mocker.patch(
+        "lnbits.core.services.notifications.dispatch_webhook",
+        AsyncMock(return_value=None),
+    )
+
+    if is_offer:
+        payment_request = BOLT12_OFFER
+    else:
+        invoice_data = await get_random_invoice_data()
+        create_response = await client.post(
+            "/api/v1/payments", json=invoice_data, headers=inkey_headers_to
+        )
+        assert create_response.status_code < 300
+        payment_request = create_response.json()["bolt11"]
+
+    webhook_url = "http://test.404.lnbits.com"
+    data = {
+        "out": True,
+        request_field: payment_request,
+        "amount": 21,
+        "webhook": webhook_url,
+    }
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=adminkey_headers_from
+    )
+    assert response.status_code < 300
+    assert response.json()["webhook"] == webhook_url
+
+
+# check GET /api/v1/payments/<hash>: payment status
+@pytest.mark.anyio
+async def test_check_payment_without_key(client, invoice: Payment):
+    # check the payment status
+    response = await client.get(f"/api/v1/payments/{invoice.payment_hash}")
+    assert response.status_code < 300
+    assert response.json()["paid"] is True
+    assert invoice
+    # not key, that's why no "details"
+    assert "details" not in response.json()
+
+
+# check GET /api/v1/payments/<hash>: payment status
+# NOTE: this test is sensitive to which db is used.
+# If postgres: it will succeed only with inkey_headers_from
+# If sqlite: it will succeed only with adminkey_headers_to
+# TODO: fix this
+@pytest.mark.anyio
+async def test_check_payment_with_key(client, invoice: Payment, inkey_headers_from):
+    # check the payment status
+    response = await client.get(
+        f"/api/v1/payments/{invoice.payment_hash}", headers=inkey_headers_from
+    )
+    assert response.status_code < 300
+    assert response.json()["paid"] is True
+    assert invoice
+    # with key, that's why with "details"
+    assert "details" in response.json()
+
+
+# check GET /api/v1/payments/<hash>: preimage requires the owning wallet's key
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [PaymentState.SUCCESS, PaymentState.PENDING])
+@pytest.mark.parametrize("key_type", [None, "invalid", "other", "inkey", "adminkey"])
+async def test_payment_preimage_requires_owning_wallet_key(
+    client, mocker, from_wallet, to_wallet, status, key_type
+):
+    preimage, payment_hash = random_secret_and_hash()
+    payment = await create_payment(
+        checking_id=uuid4().hex,
+        data=CreatePayment(
+            wallet_id=to_wallet.id,
+            payment_hash=payment_hash,
+            bolt11="",
+            amount_msat=1_000,
+            memo="preimage access",
+            preimage=preimage,
+        ),
+        status=status,
+    )
+    refresh = mocker.patch(
+        "lnbits.core.views.payment_api.update_pending_payment",
+        return_value=payment.copy(update={"status": PaymentState.SUCCESS}),
+    )
+    key = {
+        None: None,
+        "invalid": "invalid_key",
+        "other": from_wallet.adminkey,
+        "inkey": to_wallet.inkey,
+        "adminkey": to_wallet.adminkey,
+    }[key_type]
+    response = await client.get(
+        f"/api/v1/payments/{payment_hash}",
+        headers={"X-Api-Key": key} if key else {},
+    )
+
+    if key_type == "other":
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Payment does not exist."}
+        refresh.assert_not_awaited()
+        return
+
+    assert response.status_code == 200
+    if key_type in ("inkey", "adminkey"):
+        assert response.json()["paid"] is True
+        assert response.json()["preimage"] == preimage
+        assert response.json()["details"]["preimage"] == preimage
+        assert response.json()["details"]["wallet_id"] == to_wallet.id
+    else:
+        assert response.json() == {"paid": True}
+
+    if status == PaymentState.PENDING:
+        refresh.assert_awaited_once()
+    else:
+        refresh.assert_not_awaited()
+
+
+# check GET /api/v1/payments/<hash>: preimage of an unpaid invoice must not leak
+@pytest.mark.anyio
+async def test_check_pending_payment_does_not_expose_preimage(
+    client, inkey_headers_from, inkey_headers_to, adminkey_headers_from
+):
+    # create an unpaid invoice (FakeWallet stores a valid preimage at creation)
+    data = await get_random_invoice_data()
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    assert response.status_code == 201
+    unpaid = response.json()
+    payment_hash = unpaid["payment_hash"]
+
+    # unauthenticated request must not return the preimage
+    response = await client.get(f"/api/v1/payments/{payment_hash}")
+    assert response.status_code < 300
+    assert response.json()["paid"] is False
+    assert "preimage" not in response.json()
+
+    # same for an invalid key
+    response = await client.get(
+        f"/api/v1/payments/{payment_hash}", headers={"X-Api-Key": "invalid_key"}
+    )
+    assert response.json()["paid"] is False
+    assert "preimage" not in response.json()
+
+    # a valid key of a different (non-owning) wallet scopes the lookup
+    # to that wallet and therefore yields 404, leaking nothing at all
+    response = await client.get(
+        f"/api/v1/payments/{payment_hash}", headers=inkey_headers_from
+    )
+    assert response.status_code == 404
+
+    # expired unpaid invoices must not leak the preimage either
+    expiry_data = await get_random_invoice_data()
+    expiry_data["expiry"] = 1
+    response = await client.post(
+        "/api/v1/payments", json=expiry_data, headers=inkey_headers_to
+    )
+    assert response.status_code == 201
+    expired_hash = response.json()["payment_hash"]
+    await asyncio.sleep(2)
+    response = await client.get(f"/api/v1/payments/{expired_hash}")
+    assert response.json()["paid"] is False
+    assert "preimage" not in response.json()
+
+    # after payment the owning wallet can retrieve the proof of payment
+    response = await client.post(
+        "/api/v1/payments",
+        json={"out": True, "bolt11": unpaid["bolt11"]},
+        headers=adminkey_headers_from,
+    )
+    assert response.status_code < 300
+    # internal payments settle asynchronously, give the listener a moment
+    preimage = None
+    paid = False
+    for _ in range(10):
+        response = await client.get(
+            f"/api/v1/payments/{payment_hash}", headers=inkey_headers_to
+        )
+        paid = response.json()["paid"]
+        preimage = response.json()["preimage"]
+        if paid:
+            break
+        await asyncio.sleep(0.5)
+    assert paid is True
+    assert preimage is not None
+    assert hashlib.sha256(bytes.fromhex(preimage)).hexdigest() == payment_hash
+
+
+# check POST /api/v1/payments: payment with wrong key type
+@pytest.mark.anyio
+async def test_pay_invoice_wrong_key(client, invoice, adminkey_headers_from):
+    data = {"out": True, "bolt11": invoice.bolt11}
+    # try payment with wrong key
+    wrong_adminkey_headers = adminkey_headers_from.copy()
+    wrong_adminkey_headers["X-Api-Key"] = "wrong_key"
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=wrong_adminkey_headers
+    )
+    assert response.status_code >= 300  # should fail
+
+
+# check POST /api/v1/payments: payment with self payment
+@pytest.mark.anyio
+async def test_pay_invoice_self_payment(client, adminkey_headers_from):
+    create_invoice = CreateInvoice(out=False, amount=1000, memo="test")
+    response = await client.post(
+        "/api/v1/payments",
+        json=create_invoice.dict(),
+        headers=adminkey_headers_from,
+    )
+    assert response.status_code < 300
+    json_data = response.json()
+    data = {"out": True, "bolt11": json_data["bolt11"]}
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=adminkey_headers_from
+    )
+    assert response.status_code < 300
+
+
+# check POST /api/v1/payments: payment with invoice key [should fail]
+@pytest.mark.anyio
+async def test_pay_invoice_invoicekey(client, invoice, inkey_headers_from):
+    data = {"out": True, "bolt11": invoice.bolt11}
+    # try payment with invoice key
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_from
+    )
+    assert response.status_code >= 300  # should fail
+
+
+# check POST /api/v1/payments: payment with admin key, trying to pay twice [should fail]
+@pytest.mark.anyio
+async def test_pay_invoice_adminkey(client, invoice, adminkey_headers_from):
+    data = {"out": True, "bolt11": invoice.bolt11}
+    # try payment with admin key
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=adminkey_headers_from
+    )
+    assert response.status_code > 300  # should fail
+
+
+@pytest.mark.anyio
+async def test_get_payments(client, inkey_fresh_headers_to, fake_payments):
+    _, filters = fake_payments
+
+    async def get_payments(params: dict):
+        response = await client.get(
+            "/api/v1/payments",
+            params=filters | params,
+            headers=inkey_fresh_headers_to,
+        )
+        assert response.status_code == 200
+        return [Payment(**payment) for payment in response.json()]
+
+    payments = await get_payments({"sortby": "amount", "direction": "desc", "limit": 2})
+    assert len(payments) != 0
+    assert payments[-1].amount < payments[0].amount
+    assert len(payments) == 2
+
+    payments = await get_payments({"offset": 2, "limit": 2})
+    assert len(payments) == 1
+
+    payments = await get_payments({"sortby": "amount", "direction": "asc"})
+    assert payments[-1].amount > payments[0].amount
+
+    payments = await get_payments({"search": "xxx"})
+    assert len(payments) == 1
+
+    payments = await get_payments({"search": "xx"})
+    assert len(payments) == 2
+
+    # amount is in msat
+    payments = await get_payments({"amount[gt]": 10000})
+    assert len(payments) == 2
+
+
+@pytest.mark.anyio
+async def test_get_payments_paginated(client, inkey_fresh_headers_to, fake_payments):
+    fake_data, filters = fake_payments
+
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params=filters | {"limit": 2},
+        headers=inkey_fresh_headers_to,
+    )
+    assert response.status_code == 200
+    paginated = response.json()
+    data = paginated["data"]
+    assert len(data) == 2
+    assert paginated["total"] == len(fake_data)
+
+    checking_id_list = [payment["checking_id"] for payment in data]
+    params = {"checking_id[in]": ",".join(checking_id_list)}
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params=params,
+        headers=inkey_fresh_headers_to,
+    )
+    data = response.json()["data"]
+    assert len(data) == 2
+    for payment in data:
+        assert payment["checking_id"] in checking_id_list
+
+
+@pytest.mark.anyio
+async def test_get_payments_history(client, inkey_fresh_headers_to, fake_payments):
+    fake_data, filters = fake_payments
+
+    response = await client.get(
+        "/api/v1/payments/history",
+        params=filters,
+        headers=inkey_fresh_headers_to,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    assert data[0]["income"] == sum(
+        [int(payment.amount * 1000) for payment in fake_data if not payment.out]
+    )
+    assert data[0]["spending"] == sum(
+        [int(payment.amount * 1000) for payment in fake_data if payment.out]
+    )
+
+    response = await client.get(
+        "/api/v1/payments/history?group=INVALID",
+        params=filters,
+        headers=inkey_fresh_headers_to,
+    )
+
+    assert response.status_code == 400
+
+
+# check POST /api/v1/payments/decode
+@pytest.mark.anyio
+async def test_decode_invoice(client, invoice: Payment):
+    data = {"data": invoice.bolt11}
+    response = await client.post(
+        "/api/v1/payments/decode",
+        json=data,
+    )
+    assert response.status_code < 300
+    assert response.json()["payment_hash"] == invoice.payment_hash
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "offer,amount,currency,description",
+    [
+        (BOLT12_OFFER, None, None, None),
+        (BOLT12_OFFER_WITH_DESCRIPTION, None, None, "Test vectors"),
+        (BOLT12_OFFER_WITH_AMOUNT, 10_000, None, "Test vectors"),
+        (BOLT12_OFFER_WITH_CURRENCY, 10_000, "USD", "Test vectors"),
+    ],
+)
+async def test_decode_bolt12_offer(client, offer, amount, currency, description):
+    response = await client.post(
+        "/api/v1/payments/decode",
+        json={"data": "lightning:" + offer.upper()},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "type": "bolt12_offer",
+        "offer": offer,
+        "amount": amount,
+        "currency": currency,
+        "description": description,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("offer", ["lno1!!!", BOLT12_OFFER + "p"])
+async def test_decode_bolt12_offer_rejects_invalid_encoding(client, offer):
+    bad = await client.post(
+        "/api/v1/payments/decode",
+        json={"data": offer},
+    )
+    assert bad.status_code == 400
+    assert "Invalid BOLT12 offer" in bad.json()["message"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "fields", [("payment_request",), ("bolt11",), ("payment_request", "bolt11")]
+)
+async def test_pay_bolt12_offer(client, adminkey_headers_to, fields):
+    offer = BOLT12_OFFER
+    data = {"out": True, **dict.fromkeys(fields, offer)}
+    missing_amount = await client.post(
+        "/api/v1/payments",
+        json=data,
+        headers=adminkey_headers_to,
+    )
+    assert missing_amount.status_code >= 400
+
+    paid = await client.post(
+        "/api/v1/payments",
+        json={**data, "amount": 21, "unit": "sat"},
+        headers=adminkey_headers_to,
+    )
+    assert paid.status_code < 300
+    body = paid.json()
+    assert body["status"] == "success"
+    assert body["amount"] == -21_000
+    assert body["extra"]["bolt12"] is True
+    assert body["memo"] == "BOLT12 offer"
+    assert body["bolt11"].startswith("lni1")
+    assert body["payment_request"] == body["bolt11"]
+    assert body["extra"]["bolt12_offer"] == BOLT12_OFFER
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "memo",
+    [None, "", "  Thanks ☕ & = +\n" * 20, pytest.param("x" * 640, id="max-length")],
+)
+@pytest.mark.parametrize("request_field", ["payment_request", "bolt11"])
+async def test_pay_bolt12_offer_memo(
+    client, adminkey_headers_to, monkeypatch, memo, request_field
+):
+    preimage, payment_hash = random_secret_and_hash()
+    backend = AsyncMock(
+        return_value=PaymentResponse(
+            True, payment_hash, 0, preimage, payment_request="lni1resolvedinvoice"
+        )
+    )
+    monkeypatch.setattr(FakeWallet, "pay_offer", backend)
+    data = {
+        "out": True,
+        request_field: BOLT12_OFFER_WITH_DESCRIPTION,
+        "amount": 21,
+        "unit": "sat",
+        "extra": {"internal_memo": "Private memo"},
+    }
+    if memo is not None:
+        data["memo"] = memo
+
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=adminkey_headers_to
+    )
+    assert response.status_code == 201, response.text
+    backend.assert_awaited_once_with(
+        BOLT12_OFFER_WITH_DESCRIPTION,
+        fee_limit_msat=20000,
+        amount_msat=21000,
+        payer_note=memo or None,
+    )
+    payment = await get_standalone_payment(response.json()["checking_id"])
+    assert payment and payment.success
+    assert payment.bolt11 == "lni1resolvedinvoice"
+    assert payment.payment_request == "lni1resolvedinvoice"
+    assert response.json()["bolt11"] == "lni1resolvedinvoice"
+    assert response.json()["payment_request"] == "lni1resolvedinvoice"
+    assert payment.extra["bolt12_offer"] == BOLT12_OFFER_WITH_DESCRIPTION
+    assert payment.memo == (memo or "Test vectors")
+    assert payment.extra["internal_memo"] == "Private memo"
+    if memo:
+        assert payment.extra["payer_note"] == memo
+        assert payment.extra["bolt12_offer_description"] == "Test vectors"
+    else:
+        assert "payer_note" not in payment.extra
+        assert "bolt12_offer_description" not in payment.extra
+
+
+@pytest.mark.anyio
+async def test_pay_bolt12_offer_unsupported_memo(
+    client, adminkey_headers_to, monkeypatch
+):
+    backend = AsyncMock(
+        return_value=PaymentResponse(
+            ok=False, error_message="Payer notes are not supported by this backend."
+        )
+    )
+    monkeypatch.setattr(FakeWallet, "pay_offer", backend)
+    response = await client.post(
+        "/api/v1/payments",
+        json={
+            "out": True,
+            "payment_request": BOLT12_OFFER_WITH_DESCRIPTION,
+            "amount": 21,
+            "memo": "For the recipient",
+        },
+        headers=adminkey_headers_to,
+    )
+    assert response.status_code == 520, response.text
+    assert "Payer notes are not supported" in response.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_pay_bolt12_offer_memo_length_limit(
+    client, adminkey_headers_to, monkeypatch
+):
+    backend = AsyncMock()
+    monkeypatch.setattr(FakeWallet, "pay_offer", backend)
+    response = await client.post(
+        "/api/v1/payments",
+        json={
+            "out": True,
+            "payment_request": BOLT12_OFFER_WITH_DESCRIPTION,
+            "amount": 21,
+            "memo": "x" * 641,
+        },
+        headers=adminkey_headers_to,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"][0]["loc"] == ["body", "memo"]
+    backend.assert_not_awaited()
+
+
+# check api_payment() internal function call (NOT API): payment status
+@pytest.mark.anyio
+async def test_api_payment_without_key(invoice: Payment):
+    # check the payment status
+    response = await api_payment(invoice.payment_hash)
+    assert isinstance(response, dict)
+    assert response["paid"] is True
+    # no key, that's why no "details"
+    assert "details" not in response
+
+
+# check api_payment() internal function call (NOT API): payment status
+@pytest.mark.anyio
+async def test_api_payment_with_key(invoice: Payment, inkey_headers_to):
+    # check the payment status
+    response = await api_payment(invoice.payment_hash, inkey_headers_to["X-Api-Key"])
+    assert isinstance(response, dict)
+    assert response["paid"] is True
+    assert "details" in response
+
+
+# check POST /api/v1/payments: invoice creation with a description hash
+@pytest.mark.anyio
+async def test_create_invoice_with_description_hash(client, inkey_headers_to):
+    data = await get_random_invoice_data()
+    description = "asdasdasd"
+    descr_hash = hashlib.sha256(description.encode()).hexdigest()
+    data["description_hash"] = descr_hash
+    data["unhashed_description"] = description.encode().hex()
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    invoice = response.json()
+
+    invoice_bolt11 = bolt11.decode(invoice["bolt11"])
+    assert invoice_bolt11.description_hash == descr_hash
+    return invoice
+
+
+@pytest.mark.anyio
+async def test_create_invoice_with_unhashed_description(client, inkey_headers_to):
+    data = await get_random_invoice_data()
+    description = "test description"
+    descr_hash = hashlib.sha256(description.encode()).hexdigest()
+    data["unhashed_description"] = description.encode().hex()
+
+    response = await client.post(
+        "/api/v1/payments", json=data, headers=inkey_headers_to
+    )
+    invoice = response.json()
+
+    invoice_bolt11 = bolt11.decode(invoice["bolt11"])
+    assert invoice_bolt11.description_hash == descr_hash
+    assert invoice_bolt11.description is None
+    return invoice
+
+
+@pytest.mark.anyio
+async def test_update_wallet(client, adminkey_headers_from):
+    name = "new name"
+    currency = "EUR"
+
+    response = await client.patch(
+        "/api/v1/wallet", json={"name": name}, headers=adminkey_headers_from
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == name
+
+    response = await client.patch(
+        "/api/v1/wallet", json={"currency": currency}, headers=adminkey_headers_from
+    )
+    assert response.status_code == 200
+    assert response.json()["currency"] == currency
+    # name is not changed because updates are partial
+    assert response.json()["name"] == name
+
+
+@pytest.mark.anyio
+async def test_fiat_tracking(client, adminkey_headers_from, settings: Settings):
+    async def create_invoice():
+        data = await get_random_invoice_data()
+        response = await client.post(
+            "/api/v1/payments", json=data, headers=adminkey_headers_from
+        )
+        assert response.is_success
+
+        response = await client.get(
+            f"/api/v1/payments/{response.json()['payment_hash']}",
+            headers=adminkey_headers_from,
+        )
+        assert response.is_success
+        return response.json()["details"]
+
+    async def update_currency(currency):
+        response = await client.patch(
+            "/api/v1/wallet", json={"currency": currency}, headers=adminkey_headers_from
+        )
+        assert response.is_success
+        assert response.json()["currency"] == currency
+
+    await update_currency("")
+
+    settings.lnbits_default_accounting_currency = "USD"
+    payment = await create_invoice()
+    extra = payment["extra"]
+    assert extra["wallet_fiat_currency"] == "USD"
+    assert extra["wallet_fiat_amount"] != payment["amount"]
+    assert extra["wallet_fiat_rate"]
+
+    await update_currency("EUR")
+
+    payment = await create_invoice()
+    extra = payment["extra"]
+    assert extra["wallet_fiat_currency"] == "EUR"
+    assert extra["wallet_fiat_amount"] != payment["amount"]
+    assert extra["wallet_fiat_rate"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "lnurl_response_data, callback_response_data, expected_response",
+    [
+        # Happy path
+        (
+            {
+                "tag": "withdrawRequest",
+                "callback": "https://example.com/callback",
+                "k1": "randomk1value",
+                "minWithdrawable": 1000,
+                "maxWithdrawable": 1_500_000,
+            },
+            {"status": "OK"},
+            {"success": True, "message": "Payment sent with NFC."},
+        ),
+        # Error loading LNURL request
+        (
+            "error_loading_lnurl",
+            None,
+            {
+                "detail": "LNURL request failed.",
+            },
+        ),
+        # LNURL response with error status
+        (
+            {
+                "status": "ERROR",
+                "reason": "Invalid LNURL-withdraw response.",
+            },
+            None,
+            {
+                "detail": "Invalid LNURL-withdraw response.",
+            },
+        ),
+        # Invalid LNURL-withdraw pay request
+        (
+            {
+                "tag": "payRequest",
+                "callback": "https://example.com/callback",
+                "minSendable": 1000,
+                "maxSendable": 1_500_000,
+                "metadata": '[["text/plain", "Payment to yo"]]',
+            },
+            None,
+            {
+                "detail": "Invalid LNURL-withdraw response.",
+            },
+        ),
+        # Error loading callback request
+        (
+            {
+                "tag": "withdrawRequest",
+                "callback": "https://example.com/callback",
+                "k1": "randomk1value",
+                "minWithdrawable": 1000,
+                "maxWithdrawable": 1_500_000,
+            },
+            "error_loading_callback",
+            {
+                "detail": "LNURL request failed.",
+            },
+        ),
+        # Callback response with error status
+        (
+            {
+                "tag": "withdrawRequest",
+                "callback": "https://example.com/callback",
+                "k1": "randomk1value",
+                "minWithdrawable": 1000,
+                "maxWithdrawable": 1_500_000,
+            },
+            {
+                "status": "ERROR",
+                "reason": "Callback failed",
+            },
+            {
+                "detail": "Callback failed",
+            },
+        ),
+        # Unexpected exception during LNURL response JSON parsing
+        (
+            "exception_in_lnurl_response_json",
+            None,
+            {
+                "detail": "Invalid LNURL response.",
+            },
+        ),
+    ],
+)
+async def test_api_payment_pay_with_nfc(
+    client,
+    mocker: MockerFixture,
+    lnurl_response_data,
+    callback_response_data,
+    expected_response,
+):
+    payment_request = (
+        "lnbc15u1p3xnhl2pp5jptserfk3zk4qy42tlucycrfwxhydvlemu9pqr93tuzlv9cc7g3sdq"
+        "svfhkcap3xyhx7un8cqzpgxqzjcsp5f8c52y2stc300gl6s4xswtjpc37hrnnr3c9wvtgjfu"
+        "vqmpm35evq9qyyssqy4lgd8tj637qcjp05rdpxxykjenthxftej7a2zzmwrmrl70fyj9hvj0"
+        "rewhzj7jfyuwkwcg9g2jpwtk3wkjtwnkdks84hsnu8xps5vsq4gj5hs"
+    )
+    lnurl = "lnurlw://example.com/lnurl"
+
+    async def mock_send(url, *_, **__):
+        if url.path == "/lnurl":
+            if lnurl_response_data == "error_loading_lnurl":
+                return 500, {}, b""
+            elif lnurl_response_data == "exception_in_lnurl_response_json":
+                return 200, {}, b"invalid json"
+            elif isinstance(lnurl_response_data, dict):
+                return 200, {}, json.dumps(lnurl_response_data).encode()
+            else:
+                return 500, {}, b""
+        elif url.path == "/callback":
+            if callback_response_data == "error_loading_callback":
+                return 500, {}, b""
+            elif isinstance(callback_response_data, dict):
+                return 200, {}, json.dumps(callback_response_data).encode()
+            else:
+                return 500, {}, b""
+        else:
+            return 500, {}, b""
+
+    mocker.patch(
+        "lnbits.core.services.lnurl._resolve_lnurl_host",
+        AsyncMock(return_value=[ipaddress.ip_address("93.184.216.34")]),
+    )
+    mocker.patch(
+        "lnbits.core.services.lnurl._send_lnurl_request",
+        AsyncMock(side_effect=mock_send),
+    )
+
+    response = await client.post(
+        f"/api/v1/payments/{payment_request}/pay-with-nfc",
+        json={"lnurl_w": lnurl},
+    )
+
+    assert response.json() == expected_response
+
+
+@pytest.mark.anyio
+async def test_api_payments_pay_lnurl(client, adminkey_headers_from):
+    lnurl_data = {
+        "res": {
+            "callback": "https://xxxxxxx.lnbits.com",
+            "minSendable": 1000,
+            "maxSendable": 1_500_000,
+            "metadata": '[["text/plain", "Payment to yo"]]',
+        },
+        "amount": 1000,
+        "unit": "sat",
+        "comment": "test comment",
+        "description": "test description",
+    }
+
+    # Test with valid callback URL
+    response = await client.post(
+        "/api/v1/payments/lnurl", json=lnurl_data, headers=adminkey_headers_from
+    )
+    assert response.status_code == 400
+
+    # Test with invalid callback URL
+    lnurl_data["res"]["callback"] = "invalid-url.lnbits.com"
+    response = await client.post(
+        "/api/v1/payments/lnurl", json=lnurl_data, headers=adminkey_headers_from
+    )
+    assert response.status_code == 400
+    assert "invalid or missing URL scheme" in response.json()["detail"][0]["msg"]
+
+
+################################ Labels ################################
+@pytest.mark.anyio
+async def test_api_search_payment_labels(client):
+    tiny_id = shortuuid.uuid()[:8]
+    user = await create_user_account(
+        Account(
+            id=uuid4().hex,
+            username=f"u{tiny_id}",
+            extra=UserExtra(
+                labels=[
+                    UserLabel(name="label A", color="#FF0000"),
+                    UserLabel(name="label B", color="#00FF00"),
+                ]
+            ),
+        )
+    )
+    assert len(user.extra.labels) == 2
+    adminkey = user.wallets[0].adminkey
+    payments_headers = {
+        "X-Api-Key": adminkey,
+        "Content-type": "application/json",
+    }
+
+    payment_count = 10
+    await _create_some_payments(payment_count, client, payments_headers)
+
+    # search payments by label A
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": ["label A"]},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    data = response.json()
+    assert data["total"] == payment_count // 2
+    for payment in data["data"]:
+        assert "label A" in payment["labels"]
+
+    # search payments by label B
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": ["label B"]},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    data = response.json()
+    assert data["total"] == payment_count // 3
+    for payment in data["data"]:
+        assert "label B" in payment["labels"]
+
+    # search payments by label C
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": ["label C"]},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    data = response.json()
+    assert data["total"] == payment_count // 5
+    for payment in data["data"]:
+        assert "label C" in payment["labels"]
+
+    # search payments by label A and B
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": ["label A", "label B"]},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    data = response.json()
+
+    assert data["total"] == payment_count // 6
+    for payment in data["data"]:
+        assert "label A" in payment["labels"]
+        assert "label B" in payment["labels"]
+
+    # search payments for random label D (no payments)
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": ["label D"]},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    data = response.json()
+
+    assert data["total"] == 0
+
+    # search payments with no label filter (all payments)
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": []},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    all_payments = response.json()
+
+    assert all_payments["total"] == payment_count
+
+    no_label_a_payment = next(
+        (
+            payment
+            for payment in all_payments["data"]
+            if "label A" not in payment["labels"]
+        ),
+        None,
+    )
+    assert no_label_a_payment is not None
+    payment_hash = no_label_a_payment["payment_hash"]
+    response = await client.put(
+        f"/api/v1/payments/{payment_hash}/labels",
+        headers=payments_headers,
+        json={"labels": ["label A"]},
+    )
+
+    # search payments by label A after update
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": ["label A"]},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    data = response.json()
+    assert data["total"] == payment_count // 2 + 1  # one more after update
+    for payment in data["data"]:
+        assert "label A" in payment["labels"]
+
+    # remove label A from all payments
+    for payment in all_payments["data"]:
+        payment_hash = payment["payment_hash"]
+        response = await client.put(
+            f"/api/v1/payments/{payment_hash}/labels",
+            headers=payments_headers,
+            json={"labels": []},
+        )
+
+    # search payments by label A (none should have it now)
+    response = await client.get(
+        "/api/v1/payments/paginated",
+        params={"labels[every]": ["label A"]},
+        headers=payments_headers,
+    )
+    assert response.is_success
+    data = response.json()
+    assert data["total"] == 0
+
+
+async def _create_some_payments(payment_count: int, client, payments_headers):
+    payment_count = 10
+    for index in range(1, payment_count + 1):
+        labels = []
+        if index % 2 == 0:
+            labels.append("label A")
+        if index % 3 == 0:
+            labels.append("label B")
+        if index % 5 == 0:
+            # User does not have this label, but will be added to the payment.
+            labels.append("label C")
+        response = await client.post(
+            "/api/v1/payments",
+            headers=payments_headers,
+            json={
+                "out": False,
+                "amount": 1000 + index,
+                "memo": f"payment {index}",
+                "labels": labels,
+            },
+        )
+        assert response.is_success
+        data = response.json()
+        assert data["labels"] == labels
+    return payment_count

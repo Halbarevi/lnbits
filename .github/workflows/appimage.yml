@@ -1,0 +1,128 @@
+name: Build LNbits AppImage
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'The tag name for the release'
+        required: true
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'The tag name for the release'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 libcrypt1 python3-tk xvfb
+        shell: bash
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Verify frontend assets
+        run: |
+          npm ci
+          npm run bundle
+          ./node_modules/.bin/prettier -w ./lnbits/static/vendor.json
+          git diff --exit-code -- lnbits/static
+        shell: bash
+
+      - name: Build LNbits binary (uv + PyInstaller)
+        run: |
+          uv sync --locked --all-extras --no-dev --no-editable
+          uv pip install pyinstaller==6.22.2
+          uv run --no-sync python .github/packaging/build.py
+        shell: bash
+
+      - name: Test launcher window and shutdown
+        run: xvfb-run -a uv run --no-sync python -m unittest discover -s .github/packaging -v
+
+      - name: Test bundled funding runtimes
+        run: uv run --no-sync python .github/packaging/smoke_sidecars.py dist/lnbits
+
+      - name: Verify packaged dependency data
+        run: |
+          ARCHIVE_LIST="$(mktemp)"
+          trap 'rm -f "$ARCHIVE_LIST"' EXIT
+          .venv/bin/pyi-archive_viewer -l dist/lnbits > "$ARCHIVE_LIST"
+
+          for ASSET in \
+            certifi/cacert.pem \
+            grpc/_cython/_credentials/roots.pem \
+            pyinstrument/renderers/html_resources/app.css \
+            pyinstrument/renderers/html_resources/app.js \
+            random_username/data/adjectives.txt \
+            random_username/data/nouns.txt; do
+            grep --fixed-strings --quiet "'$ASSET'" "$ARCHIVE_LIST" || {
+              echo "Missing packaged dependency data: $ASSET" >&2
+              exit 1
+            }
+          done
+        shell: bash
+
+      - name: Stage AppDir
+        run: |
+          mkdir -p packaging/linux
+          cp -a .github/packaging/linux/AppDir packaging/linux/AppDir
+          mkdir -p packaging/linux/AppDir/usr/lnbits
+          mkdir -p packaging/linux/AppDir/usr/lnbits/dist
+          install -m 755 dist/lnbits packaging/linux/AppDir/usr/lnbits/dist/lnbits
+          chmod +x packaging/linux/AppDir/AppRun
+          chmod +x packaging/linux/AppDir/lnbits.desktop
+
+        shell: bash
+
+      - name: Smoke test packaged binary, assets and shutdown
+        run: uv run --no-sync python .github/packaging/smoke.py dist/lnbits
+
+      - name: Build AppImage
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          APPIMAGE_NAME="LNbits-${TAG_NAME}.AppImage"
+          ./appimagetool-x86_64.AppImage \
+            packaging/linux/AppDir "$APPIMAGE_NAME"
+          chmod +x "$APPIMAGE_NAME"
+          echo "APPIMAGE_NAME=$APPIMAGE_NAME" >> "$GITHUB_ENV"
+
+        shell: bash
+
+      - name: Smoke test final AppImage and shutdown
+        run: uv run --no-sync python .github/packaging/smoke.py "$APPIMAGE_NAME"
+
+      - name: Upload Linux Release Asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: gh release upload "$TAG_NAME" "$APPIMAGE_NAME" --clobber

@@ -1,0 +1,757 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+from lnurl import LnurlSuccessResponse, LnurlWithdrawResponse
+from pytest_mock.plugin import MockerFixture
+
+from lnbits.core.crud import (
+    create_account,
+    create_payment,
+    create_wallet,
+    get_payment,
+    get_payments,
+    update_payment,
+)
+from lnbits.core.models import (
+    Account,
+    CreateInvoice,
+    CreatePayment,
+    PaymentState,
+    Wallet,
+)
+from lnbits.core.services.payments import (
+    calculate_fiat_amounts,
+    cancel_hold_invoice,
+    check_payment_status,
+    check_pending_payments,
+    check_time_limit_between_transactions,
+    check_transaction_status,
+    check_wallet_daily_withdraw_limit,
+    check_wallet_limits,
+    create_payment_request,
+    create_wallet_invoice,
+    get_payments_daily_stats,
+    settle_hold_invoice,
+    update_pending_payment,
+    update_pending_payments,
+    update_wallet_balance,
+)
+from lnbits.db import Filters, Page
+from lnbits.exceptions import InvoiceError, PaymentError
+from lnbits.settings import Settings
+from lnbits.wallets.base import (
+    InvoiceResponse,
+    PaymentFailedStatus,
+    PaymentPendingStatus,
+    PaymentResponse,
+    PaymentStatus,
+    PaymentSuccessStatus,
+)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, (True, False, False)),
+        (None, (False, True, False)),
+        (False, (False, False, True)),
+    ],
+)
+def test_payment_response_states_are_mutually_exclusive(value, expected):
+    response = PaymentResponse(ok=value)
+    assert (response.success, response.pending, response.failed) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, (True, False, False)),
+        (None, (False, True, False)),
+        (False, (False, True, True)),
+    ],
+)
+def test_payment_status_properties(value, expected):
+    status = PaymentStatus(paid=value)
+    assert (status.success, status.pending, status.failed) == expected
+
+
+@pytest.mark.anyio
+async def test_create_payment_request_routes_by_invoice_type(mocker: MockerFixture):
+    wallet_payment = SimpleNamespace(checking_id="wallet")
+    fiat_payment = SimpleNamespace(checking_id="fiat")
+    wallet_mock = mocker.patch(
+        "lnbits.core.services.payments.create_wallet_invoice",
+        mocker.AsyncMock(return_value=wallet_payment),
+    )
+    fiat_mock = mocker.patch(
+        "lnbits.core.services.payments.create_fiat_invoice",
+        mocker.AsyncMock(return_value=fiat_payment),
+    )
+
+    assert (
+        await create_payment_request("wallet-1", CreateInvoice(amount=1))
+        == wallet_payment
+    )
+    assert (
+        await create_payment_request(
+            "wallet-1",
+            CreateInvoice(amount=1, fiat_provider="stripe"),
+        )
+        == fiat_payment
+    )
+    wallet_mock.assert_awaited_once()
+    fiat_mock.assert_awaited_once()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("fiat_provider", ("stripe", "square", "paypal"))
+async def test_create_payment_request_rejects_fiat_subscription(
+    fiat_provider: str, mocker: MockerFixture
+):
+    fiat_mock = mocker.patch(
+        "lnbits.core.services.payments.create_fiat_invoice",
+        mocker.AsyncMock(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Cannot create direct fiat subscription payments.",
+    ):
+        await create_payment_request(
+            "wallet-1",
+            CreateInvoice(
+                unit="USD",
+                amount=2100,
+                fiat_provider=fiat_provider,
+                extra={
+                    "fiat_method": "subscription",
+                    "subscription": {
+                        "checking_id": "fiat_stripe_cs_paid_session",
+                        "payment_request": "",
+                    },
+                },
+            ),
+        )
+
+    fiat_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_lnurl_withdraw_success_keeps_invoice_pending(mocker: MockerFixture):
+    wallet = await _create_wallet()
+    withdraw_mock = mocker.patch(
+        "lnbits.core.services.payments.lnurl_withdraw",
+        mocker.AsyncMock(return_value=LnurlSuccessResponse()),
+    )
+    mocker.patch("lnbits.core.services.payments.check_callback_url")
+
+    payment = await create_wallet_invoice(
+        wallet.id,
+        CreateInvoice(
+            amount=1,
+            out=False,
+            lnurl_withdraw=LnurlWithdrawResponse.parse_obj(
+                {
+                    "tag": "withdrawRequest",
+                    "callback": "https://example.com/callback",
+                    "k1": "randomk1value",
+                    "minWithdrawable": 1000,
+                    "maxWithdrawable": 1_500_000,
+                }
+            ),
+        ),
+    )
+
+    assert payment.status == PaymentState.PENDING
+    assert payment.extra["lnurl_response"] is True
+    withdraw_mock.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_webhook_is_validated_before_invoice_creation(mocker: MockerFixture):
+    wallet = await _create_wallet()
+    create_invoice_mock = mocker.patch(
+        "lnbits.core.services.payments.create_invoice",
+        mocker.AsyncMock(),
+    )
+
+    with pytest.raises(ValueError, match="Callback URL is not allowed"):
+        await create_wallet_invoice(
+            wallet.id,
+            CreateInvoice(
+                amount=1,
+                out=False,
+                webhook=("http://ok.example.com@169.254.169.254/latest/meta-data/"),
+            ),
+        )
+
+    create_invoice_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_update_pending_payment_and_bulk_pending_updates(mocker: MockerFixture):
+    wallet = await _create_wallet()
+    failed_id = await _create_payment(wallet)
+    success_id = await _create_payment(wallet)
+    failed_payment = await get_payment(failed_id)
+    success_payment = await get_payment(success_id)
+
+    mocker.patch(
+        "lnbits.core.services.payments.check_payment_status",
+        mocker.AsyncMock(side_effect=[PaymentFailedStatus(), PaymentSuccessStatus()]),
+    )
+
+    await update_pending_payment(failed_payment)
+    await update_pending_payment(success_payment)
+
+    assert (await get_payment(failed_id)).status == PaymentState.FAILED
+    assert (await get_payment(success_id)).status == PaymentState.SUCCESS
+
+    bulk_wallet = await _create_wallet()
+    bulk_failed_id = await _create_payment(bulk_wallet)
+    bulk_success_id = await _create_payment(bulk_wallet)
+    mocker.patch(
+        "lnbits.core.services.payments.check_payment_status",
+        mocker.AsyncMock(side_effect=[PaymentFailedStatus(), PaymentSuccessStatus()]),
+    )
+
+    await update_pending_payments(bulk_wallet.id)
+
+    bulk_statuses = {
+        (await get_payment(bulk_failed_id)).status,
+        (await get_payment(bulk_success_id)).status,
+    }
+    assert bulk_statuses == {PaymentState.FAILED, PaymentState.SUCCESS}
+
+
+@pytest.mark.anyio
+async def test_update_pending_payment_marks_expired_incoming_invoice_failed(
+    app,
+    mocker: MockerFixture,
+):
+    wallet = await _create_wallet()
+    checking_id = await _create_payment(
+        wallet,
+        expiry=datetime.now(timezone.utc) - timedelta(seconds=1),
+        labels=["test"],
+    )
+    payment = await get_payment(checking_id)
+    check_status_mock = mocker.patch(
+        "lnbits.core.services.payments.check_payment_status",
+        mocker.AsyncMock(
+            side_effect=AssertionError("expired invoices should not be checked")
+        ),
+    )
+
+    updated_payment = await update_pending_payment(payment)
+
+    assert updated_payment.status == PaymentState.FAILED
+    assert updated_payment.labels == ["test", "expired"]
+    check_status_mock.assert_not_awaited()
+
+    stored_payment = await get_payment(checking_id)
+    assert stored_payment.status == PaymentState.FAILED
+    assert stored_payment.labels == ["test", "expired"]
+
+
+@pytest.mark.anyio
+async def test_check_pending_payments_skips_voidwallet_and_updates_recent_items(
+    mocker: MockerFixture,
+):
+    class VoidWallet:
+        pass
+
+    class FakeWalletSource:
+        pass
+
+    mocker.patch(
+        "lnbits.core.services.payments.get_funding_source",
+        return_value=VoidWallet(),
+    )
+    # Keep the session's background tasks on the real asyncio.sleep.
+    asyncio_mock = SimpleNamespace(**vars(asyncio))
+    sleep_mock = asyncio_mock.sleep = mocker.AsyncMock()
+    mocker.patch("lnbits.core.services.payments.asyncio", asyncio_mock)
+
+    await check_pending_payments()
+    sleep_mock.assert_not_awaited()
+
+    existing_pending = await get_payments(pending=True, exclude_uncheckable=True)
+    wallet = await _create_wallet()
+    checking_id = await _create_payment(wallet)
+    mocker.patch(
+        "lnbits.core.services.payments.get_funding_source",
+        return_value=FakeWalletSource(),
+    )
+    mocker.patch(
+        "lnbits.core.services.payments.check_payment_status",
+        mocker.AsyncMock(return_value=PaymentSuccessStatus()),
+    )
+
+    try:
+        await check_pending_payments()
+    finally:
+        for payment in existing_pending:
+            payment.status = PaymentState.PENDING
+            await update_payment(payment)
+
+    assert (await get_payment(checking_id)).status == PaymentState.SUCCESS
+    assert sleep_mock.await_count >= 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("payment_count", "outcomes", "expected_offsets"),
+    [
+        pytest.param(0, (PaymentState.PENDING,), [0], id="empty"),
+        pytest.param(
+            205, (PaymentState.PENDING,), [0, 100, 200, 205], id="all-pending"
+        ),
+        pytest.param(205, (PaymentState.FAILED,), [0, 0, 0, 0], id="all-failed"),
+        pytest.param(205, (PaymentState.SUCCESS,), [0, 0, 0, 0], id="all-success"),
+        pytest.param(
+            205,
+            (PaymentState.PENDING, PaymentState.FAILED, PaymentState.SUCCESS),
+            [0, 34, 67, 69],
+            id="mixed-statuses",
+        ),
+        pytest.param(
+            1_100, (PaymentState.PENDING,), list(range(0, 1_000, 100)), id="pending-cap"
+        ),
+        pytest.param(1_100, (PaymentState.FAILED,), [0] * 10, id="resolved-cap"),
+    ],
+)
+async def test_check_pending_payments_batches_and_progress(
+    mocker: MockerFixture,
+    payment_count: int,
+    outcomes: tuple[PaymentState, ...],
+    expected_offsets: list[int],
+):
+    payments = {
+        f"payment-{i}": SimpleNamespace(
+            checking_id=f"payment-{i}", status=PaymentState.PENDING
+        )
+        for i in range(payment_count)
+    }
+    offsets = []
+    start_time = 2_000_000_000
+
+    async def fetch_page(*, since, complete, pending, exclude_uncheckable, filters):
+        assert since == start_time - 15 * 24 * 60 * 60
+        assert complete is False
+        assert pending is True
+        assert exclude_uncheckable is True
+        assert filters.sortby == "created_at"
+        assert filters.direction == "asc"
+        assert filters.limit == 100
+        offsets.append(filters.offset)
+        remaining = [
+            payment
+            for payment in payments.values()
+            if payment.status == PaymentState.PENDING
+        ]
+        # Each query returns fresh objects, as the CRUD function does.
+        return Page(
+            data=[
+                SimpleNamespace(**vars(payment))
+                for payment in remaining[
+                    filters.offset : filters.offset + filters.limit
+                ]
+            ],
+            total=len(remaining),
+        )
+
+    async def update_pending(payment):
+        index = int(payment.checking_id.removeprefix("payment-"))
+        stored_payment = payments[payment.checking_id]
+        stored_payment.status = outcomes[index % len(outcomes)]
+        return stored_payment
+
+    mocker.patch(
+        "lnbits.core.services.payments.get_funding_source", return_value=object()
+    )
+    mocker.patch(
+        "lnbits.core.services.payments.time",
+        SimpleNamespace(
+            time=mocker.Mock(side_effect=range(start_time, start_time + 100))
+        ),
+    )
+    page_mock = mocker.patch(
+        "lnbits.core.services.payments.get_payments_paginated",
+        mocker.AsyncMock(side_effect=fetch_page),
+    )
+    update_mock = mocker.patch(
+        "lnbits.core.services.payments.update_pending_payment",
+        mocker.AsyncMock(side_effect=update_pending),
+    )
+    asyncio_mock = SimpleNamespace(**vars(asyncio))
+    asyncio_mock.sleep = mocker.AsyncMock()
+    mocker.patch("lnbits.core.services.payments.asyncio", asyncio_mock)
+    logger_mock = mocker.patch("lnbits.core.services.payments.logger")
+
+    await check_pending_payments()
+
+    checked = min(payment_count, 1_000)
+    assert offsets == expected_offsets
+    assert page_mock.await_count == len(expected_offsets)
+    assert [call.args[0].checking_id for call in update_mock.await_args_list] == list(
+        payments
+    )[:checked]
+    assert [call.args[0] for call in logger_mock.debug.call_args_list] == [
+        f"payment ({i + 1}/{payment_count}) {outcomes[i % len(outcomes)]} payment-{i}"
+        for i in range(checked)
+    ]
+    logger_mock.info.assert_any_call(
+        "Task: checking pending payments of last 15 days..."
+    )
+    if checked:
+        assert logger_mock.info.call_args.args[0].startswith(
+            f"Task: pending check finished for {checked} payments"
+        )
+    else:
+        logger_mock.info.assert_any_call(
+            "Task: no pending payments found in the last 15 days"
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("memo", "expected_credit_memo", "expected_debit_memo"),
+    [
+        (None, "Credit", "Debit"),
+        ("", "Credit", "Debit"),
+        (" \t\n ", "Credit", "Debit"),
+        ("Balance adjustment", "Balance adjustment", "Balance adjustment"),
+        ("  Balance adjustment  ", "Balance adjustment", "Balance adjustment"),
+    ],
+)
+async def test_update_wallet_balance_validates_credit_and_debit(
+    settings: Settings,
+    mocker: MockerFixture,
+    memo: str | None,
+    expected_credit_memo: str,
+    expected_debit_memo: str,
+):
+    wallet = await _create_wallet()
+    wallet.balance_msat = 20_000
+
+    with pytest.raises(ValueError, match="Amount cannot be 0."):
+        await update_wallet_balance(wallet, 0, memo=memo)
+
+    with pytest.raises(ValueError, match="can not go into negative balance"):
+        await update_wallet_balance(wallet, -30, memo=memo)
+
+    payment_secret = (uuid4().hex * 2)[:64]
+    payment_hash = (uuid4().hex * 2)[:64]
+    mocker.patch(
+        "lnbits.core.services.payments.random_secret_and_hash",
+        return_value=(payment_secret, payment_hash),
+    )
+    mocker.patch(
+        "lnbits.core.services.payments.fake_privkey",
+        return_value="privkey",
+    )
+    bolt11_encode_mock = mocker.patch(
+        "lnbits.core.services.payments.bolt11_encode",
+        return_value="encoded-bolt11",
+    )
+
+    await update_wallet_balance(wallet, -10, memo=memo)
+
+    debit_payment = await get_payment("internal_" + payment_hash)
+    assert debit_payment is not None
+    assert debit_payment.amount == -10_000
+    assert debit_payment.status == PaymentState.SUCCESS
+    assert debit_payment.memo == expected_debit_memo
+    assert debit_payment.extra["tag"] == "admin"
+    bolt11_encode_mock.assert_called_once()
+    assert bolt11_encode_mock.call_args[0][0].description == expected_debit_memo
+
+    original_max_balance = settings.lnbits_wallet_limit_max_balance
+    try:
+        settings.lnbits_wallet_limit_max_balance = 21
+        with pytest.raises(ValueError, match="amount exceeds maximum balance"):
+            await update_wallet_balance(wallet, 5, memo=memo)
+
+        settings.lnbits_wallet_limit_max_balance = 0
+        queue_mock = mocker.patch(
+            "lnbits.task_manager.task_manager.internal_invoice_queue.put_nowait",
+        )
+
+        await update_wallet_balance(wallet, 5, memo=memo)
+    finally:
+        settings.lnbits_wallet_limit_max_balance = original_max_balance
+
+    credit_payments = await get_payments(wallet_id=wallet.id, incoming=True)
+    assert len(credit_payments) == 1
+    assert credit_payments[0].amount == 5_000
+    assert credit_payments[0].status == PaymentState.SUCCESS
+    assert credit_payments[0].memo == expected_credit_memo
+    assert credit_payments[0].extra["tag"] == "admin"
+    queue_mock.assert_called_once()
+    assert queue_mock.call_args[0][0].checking_id == credit_payments[0].checking_id
+
+
+@pytest.mark.anyio
+async def test_check_wallet_limits_and_time_limit(
+    settings: Settings, mocker: MockerFixture
+):
+    time_limit_mock = mocker.patch(
+        "lnbits.core.services.payments.check_time_limit_between_transactions",
+        mocker.AsyncMock(),
+    )
+    daily_limit_mock = mocker.patch(
+        "lnbits.core.services.payments.check_wallet_daily_withdraw_limit",
+        mocker.AsyncMock(),
+    )
+
+    await check_wallet_limits("wallet-1", 1_000)
+
+    time_limit_mock.assert_awaited_once_with("wallet-1", None)
+    daily_limit_mock.assert_awaited_once_with("wallet-1", 1_000, None)
+
+    wallet = await _create_wallet()
+    await _create_payment(wallet, amount_msat=-2_000)
+    original_limit = settings.lnbits_wallet_limit_secs_between_trans
+    try:
+        settings.lnbits_wallet_limit_secs_between_trans = 30
+        with pytest.raises(PaymentError) as exc_info:
+            await check_time_limit_between_transactions(wallet.id)
+        assert "30 seconds between payments" in exc_info.value.message
+
+        other_wallet = await _create_wallet()
+        assert await check_time_limit_between_transactions(other_wallet.id) is None
+    finally:
+        settings.lnbits_wallet_limit_secs_between_trans = original_limit
+
+
+@pytest.mark.anyio
+async def test_check_wallet_daily_limit_counts_all_daily_payments(settings: Settings):
+    wallet = await _create_wallet()
+    await _create_payment(wallet, amount_msat=-2_000, status=PaymentState.SUCCESS)
+    await _create_payment(wallet, amount_msat=-3_000, status=PaymentState.SUCCESS)
+
+    original_limit = settings.lnbits_wallet_limit_daily_max_withdraw
+    try:
+        settings.lnbits_wallet_limit_daily_max_withdraw = 5
+        with pytest.raises(
+            ValueError, match="Daily withdrawal limit of 5 sats reached."
+        ):
+            await check_wallet_daily_withdraw_limit(wallet.id, 1_000)
+    finally:
+        settings.lnbits_wallet_limit_daily_max_withdraw = original_limit
+
+
+@pytest.mark.anyio
+async def test_calculate_fiat_amounts_handles_conversion_and_errors(
+    mocker: MockerFixture,
+):
+    wallet = await _create_wallet()
+    wallet.currency = "EUR"
+    mocker.patch(
+        "lnbits.core.services.payments.fiat_amount_as_satoshis",
+        mocker.AsyncMock(return_value=200),
+    )
+    sat_to_fiat_mock = mocker.patch(
+        "lnbits.core.services.payments.satoshis_amount_as_fiat",
+        mocker.AsyncMock(return_value=1.5),
+    )
+
+    amount_sat, fiat_amounts = await calculate_fiat_amounts(2.0, wallet, "USD")
+
+    assert amount_sat == 200
+    assert fiat_amounts["fiat_currency"] == "USD"
+    assert fiat_amounts["wallet_fiat_currency"] == "EUR"
+    assert fiat_amounts["wallet_fiat_amount"] == 1.5
+
+    sat_to_fiat_mock.side_effect = Exception("boom")
+    amount_sat, fiat_amounts = await calculate_fiat_amounts(10, wallet, "sat", extra={})
+
+    assert amount_sat == 10
+    assert fiat_amounts == {}
+
+
+@pytest.mark.anyio
+async def test_check_transaction_status_and_payment_status(mocker: MockerFixture):
+    wallet = await _create_wallet()
+    missing_hash = uuid4().hex
+    assert (await check_transaction_status(wallet.id, missing_hash)).pending is True
+
+    success_hash = uuid4().hex
+    success_id = await _create_payment(
+        wallet,
+        status=PaymentState.SUCCESS,
+        payment_hash=success_hash,
+        fee=-123,
+    )
+    success_status = await check_transaction_status(wallet.id, success_hash)
+    assert success_status.success is True
+    assert success_status.fee_msat == -123
+
+    pending_hash = uuid4().hex
+    await _create_payment(wallet, payment_hash=pending_hash)
+    mocker.patch(
+        "lnbits.core.services.payments.check_payment_status",
+        mocker.AsyncMock(return_value=PaymentFailedStatus()),
+    )
+    assert (await check_transaction_status(wallet.id, pending_hash)).failed is True
+
+    internal_success = await get_payment(success_id)
+    internal_success.checking_id = "internal_" + internal_success.payment_hash
+    internal_success.status = PaymentState.SUCCESS.value
+    assert (await check_payment_status(internal_success)).success is True
+
+    internal_failed = await get_payment(success_id)
+    internal_failed.checking_id = "internal_" + internal_failed.payment_hash
+    internal_failed.status = PaymentState.FAILED.value
+    assert (await check_payment_status(internal_failed)).failed is True
+
+    internal_fiat = await get_payment(success_id)
+    internal_fiat.checking_id = "fiat_" + internal_fiat.payment_hash
+    internal_fiat.status = PaymentState.PENDING.value
+    internal_fiat.fiat_provider = "stripe"
+    mocker.patch(
+        "lnbits.core.services.payments.check_fiat_status",
+        mocker.AsyncMock(return_value=SimpleNamespace(paid=True)),
+    )
+    assert (await check_payment_status(internal_fiat)).success is True
+
+    outgoing = await get_payment(success_id)
+    outgoing.checking_id = "external-out"
+    outgoing.amount = -2_000
+    incoming = await get_payment(success_id)
+    incoming.checking_id = "external-in"
+    incoming.amount = 2_000
+    funding_source = SimpleNamespace(
+        get_payment_status=mocker.AsyncMock(return_value=PaymentSuccessStatus()),
+        get_invoice_status=mocker.AsyncMock(return_value=PaymentPendingStatus()),
+    )
+    mocker.patch(
+        "lnbits.core.services.payments.get_funding_source",
+        return_value=funding_source,
+    )
+
+    assert (await check_payment_status(outgoing)).success is True
+    assert (await check_payment_status(incoming)).pending is True
+
+
+@pytest.mark.anyio
+async def test_get_payments_daily_stats_fills_missing_dates():
+    wallet = await _create_wallet()
+    user_id = wallet.user
+    now = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+    await _create_payment(
+        wallet,
+        amount_msat=2_000,
+        status=PaymentState.SUCCESS,
+        time=now - timedelta(days=2),
+    )
+    await _create_payment(
+        wallet,
+        amount_msat=-500,
+        status=PaymentState.SUCCESS,
+        fee=100,
+        time=now,
+    )
+
+    stats = await get_payments_daily_stats(Filters(), user_id=user_id)
+
+    assert [point.date.date() for point in stats[-3:]] == [
+        (now - timedelta(days=2)).date(),
+        (now - timedelta(days=1)).date(),
+        now.date(),
+    ]
+    assert [point.balance for point in stats[-3:]] == [2, 2, 1]
+    assert stats[-1].fee == 0
+
+
+@pytest.mark.anyio
+async def test_settle_and_cancel_hold_invoice_persist_status(mocker: MockerFixture):
+    wallet = await _create_wallet()
+    checking_id = await _create_payment(wallet, payment_hash="33" * 32)
+    payment = await get_payment(checking_id)
+    funding_source = SimpleNamespace(
+        settle_hold_invoice=mocker.AsyncMock(
+            return_value=InvoiceResponse(ok=True, checking_id="settled")
+        ),
+        cancel_hold_invoice=mocker.AsyncMock(
+            return_value=InvoiceResponse(ok=True, checking_id="cancelled")
+        ),
+    )
+    mocker.patch(
+        "lnbits.core.services.payments.get_funding_source",
+        return_value=funding_source,
+    )
+    mocker.patch(
+        "lnbits.core.services.payments.verify_preimage",
+        return_value=False,
+    )
+
+    with pytest.raises(InvoiceError, match="Invalid preimage."):
+        await settle_hold_invoice(payment, "00" * 32)
+
+    mocker.patch(
+        "lnbits.core.services.payments.verify_preimage",
+        return_value=True,
+    )
+
+    assert (await settle_hold_invoice(payment, "11" * 32)).ok is True
+    assert (await cancel_hold_invoice(payment)).ok is True
+
+    stored = await get_payment(checking_id)
+    assert stored.preimage == "11" * 32
+    assert stored.extra["hold_invoice_settled"] is True
+    assert stored.extra["hold_invoice_cancelled"] is True
+    assert stored.status == PaymentState.FAILED
+
+
+def _account() -> Account:
+    account_id = uuid4().hex
+    return Account(id=account_id, username=f"user_{account_id[:8]}")
+
+
+async def _create_wallet() -> Wallet:
+    account = _account()
+    await create_account(account)
+    return await create_wallet(
+        user_id=account.id, wallet_name=f"wallet_{account.id[:8]}"
+    )
+
+
+async def _create_payment(
+    wallet: Wallet,
+    *,
+    amount_msat: int = 2_000,
+    status: PaymentState = PaymentState.PENDING,
+    checking_id: str | None = None,
+    payment_hash: str | None = None,
+    fee: int = 0,
+    time: datetime | None = None,
+    expiry: datetime | None = None,
+    labels: list[str] | None = None,
+) -> str:
+    checking_id = checking_id or f"checking_{uuid4().hex[:8]}"
+    payment_hash = payment_hash or uuid4().hex
+    payment = await create_payment(
+        checking_id=checking_id,
+        data=CreatePayment(
+            wallet_id=wallet.id,
+            payment_hash=payment_hash,
+            bolt11=f"bolt11-{checking_id}",
+            amount_msat=amount_msat,
+            memo="memo",
+            expiry=expiry,
+            fee=fee,
+            labels=labels,
+        ),
+        status=status,
+    )
+    if time:
+        payment.time = time
+        payment.created_at = time
+        payment.updated_at = time
+        await update_payment(payment)
+    return checking_id

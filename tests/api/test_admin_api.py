@@ -1,0 +1,263 @@
+from pathlib import Path
+
+import pytest
+from httpx import AsyncClient
+
+from lnbits.core.crud.settings import get_settings_field, set_settings_field
+from lnbits.core.models import BalanceDelta
+from lnbits.server import server_restart
+from lnbits.settings import DEFAULT_WASM_MANIFESTS, Settings
+
+
+@pytest.mark.anyio
+async def test_admin_get_settings_permission_denied(client, from_user):
+    response = await client.get(f"/admin/api/v1/settings?usr={from_user.id}")
+    assert response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_admin_get_settings(client: AsyncClient, superuser_token: str):
+    response = await client.get(
+        "/admin/api/v1/settings",
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert "super_user" not in result
+    assert result["lnbits_wasm_extensions_manifests"] == DEFAULT_WASM_MANIFESTS
+
+
+@pytest.mark.anyio
+async def test_admin_update_settings(
+    client: AsyncClient, superuser_token: str, settings: Settings
+):
+    new_site_title = "UPDATED SITETITLE"
+    response = await client.put(
+        "/admin/api/v1/settings",
+        json={"lnbits_site_title": new_site_title},
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert "status" in result
+    assert result.get("status") == "Success"
+    assert settings.lnbits_site_title == new_site_title
+
+
+@pytest.mark.anyio
+async def test_admin_update_noneditable_settings(
+    client: AsyncClient,
+    superuser_token: str,
+):
+    response = await client.put(
+        "/admin/api/v1/settings",
+        json={"super_user": "UPDATED"},
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_admin_audit_monitor_and_test_email(
+    client: AsyncClient, superuser_token: str, mocker
+):
+    mocker.patch(
+        "lnbits.core.views.admin_api.get_balance_delta",
+        mocker.AsyncMock(
+            return_value=BalanceDelta(lnbits_balance_sats=21, node_balance_sats=13)
+        ),
+    )
+    fiat_balance = mocker.patch(
+        "lnbits.core.views.admin_api.get_total_balance",
+        mocker.AsyncMock(return_value=1234567),
+    )
+    mocker.patch(
+        "lnbits.core.views.admin_api.send_email_notification",
+        mocker.AsyncMock(return_value={"status": "queued"}),
+    )
+
+    audit = await client.get(
+        "/admin/api/v1/audit",
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert audit.status_code == 200
+    assert audit.json()["lnbits_balance_sats"] == 21
+    assert audit.json()["lnbits_fiat_balance_sats"] == 1234
+    fiat_balance.assert_awaited_once_with(fiat=True)
+
+    monitor = await client.get(
+        "/admin/api/v1/monitor",
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert monitor.status_code == 200
+    task_names = [t["name"] for t in monitor.json()]
+    assert "core_invoice_listener" in task_names
+    assert "core_wasm_invoice_listener" in task_names
+
+    test_email = await client.get(
+        "/admin/api/v1/testemail",
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert test_email.status_code == 200
+    assert test_email.json()["status"] == "queued"
+
+
+@pytest.mark.anyio
+async def test_admin_partial_reset_restart_and_backup(
+    client: AsyncClient,
+    superuser_token: str,
+    settings: Settings,
+    tmp_path,
+):
+    response = await client.patch(
+        "/admin/api/v1/settings",
+        json={"lnbits_site_title": "PATCHED TITLE"},
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "Success"
+
+    default_value = await client.get(
+        "/admin/api/v1/settings/default",
+        params={"field_name": "lnbits_site_title"},
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert default_value.status_code == 200
+    assert "default_value" in default_value.json()
+
+    backup_path = Path("lnbits-backup.zip")
+    original_data_folder = settings.lnbits_data_folder
+
+    try:
+        data_folder = tmp_path / "backup_data"
+        data_folder.mkdir(parents=True, exist_ok=True)
+        (data_folder / "sample.txt").write_text("backup me")
+        settings.lnbits_data_folder = str(data_folder)
+
+        backup = await client.get(
+            "/admin/api/v1/backup",
+            headers={"Authorization": f"Bearer {superuser_token}"},
+        )
+        assert backup.status_code == 200
+        assert backup.headers["content-type"] == "application/zip"
+        assert backup.content.startswith(b"PK")
+        assert backup_path.is_file()
+    finally:
+        settings.lnbits_data_folder = original_data_folder
+        backup_path.unlink(missing_ok=True)
+
+    server_restart.clear()
+    restart = await client.get(
+        "/admin/api/v1/restart",
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert restart.status_code == 200
+    assert restart.json()["status"] == "Success"
+    assert server_restart.is_set() is True
+    server_restart.clear()
+
+
+@pytest.mark.anyio
+async def test_admin_delete_settings_requires_superuser(
+    client: AsyncClient, superuser_token: str
+):
+    await set_settings_field("lnbits_site_title", "Reset me")
+    await set_settings_field("lnbits_backend_wallet_class", "BoltzWallet")
+    await set_settings_field("boltz_mnemonic", "keep boltz seed")
+    await set_settings_field("boltz_mnemonic_backup_confirmed", True)
+    await set_settings_field("phoenixd_mnemonic", "keep phoenixd seed")
+    await set_settings_field("phoenixd_mnemonic_backup_confirmed", True)
+    await set_settings_field("spark_l2_mnemonic", "keep spark seed")
+    await set_settings_field("spark_l2_mnemonic_backup_confirmed", True)
+
+    server_restart.clear()
+    response = await client.delete(
+        "/admin/api/v1/settings",
+        headers={"Authorization": f"Bearer {superuser_token}"},
+    )
+    assert response.status_code == 200
+    assert server_restart.is_set() is True
+    assert await get_settings_field("lnbits_site_title") is None
+
+    backend_wallet = await get_settings_field("lnbits_backend_wallet_class")
+    boltz_seed = await get_settings_field("boltz_mnemonic")
+    boltz_confirmed = await get_settings_field("boltz_mnemonic_backup_confirmed")
+    phoenixd_seed = await get_settings_field("phoenixd_mnemonic")
+    phoenixd_confirmed = await get_settings_field("phoenixd_mnemonic_backup_confirmed")
+    spark_l2_seed = await get_settings_field("spark_l2_mnemonic")
+    spark_l2_confirmed = await get_settings_field("spark_l2_mnemonic_backup_confirmed")
+    assert backend_wallet and backend_wallet.value == "BoltzWallet"
+    assert boltz_seed and boltz_seed.value == "keep boltz seed"
+    assert boltz_confirmed and boltz_confirmed.value is True
+    assert phoenixd_seed and phoenixd_seed.value == "keep phoenixd seed"
+    assert phoenixd_confirmed and phoenixd_confirmed.value is True
+    assert spark_l2_seed and spark_l2_seed.value == "keep spark seed"
+    assert spark_l2_confirmed and spark_l2_confirmed.value is True
+
+    server_restart.clear()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "method,path",
+    [("GET", ""), ("POST", ""), ("POST", "/backup"), ("POST", "/confirm")],
+)
+async def test_onchain_key_requires_superuser(client, from_user, method, path):
+    response = await client.request(
+        method, f"/admin/api/v1/onchain/key{path}", params={"usr": from_user.id}
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_onchain_key_survives_settings_reset(
+    client, superuser_token, settings, tmp_path, monkeypatch
+):
+    from lnbits.core.crud.settings import reset_core_settings
+    from lnbits.core.db import db
+    from lnbits.core.services.onchain import KEY_RECORD, key_path
+
+    original = await get_settings_field(KEY_RECORD)
+    monkeypatch.setattr(settings, "lnbits_data_folder", str(tmp_path))
+    monkeypatch.setattr(settings, "lnbits_onchain_master_key", None)
+    monkeypatch.delenv("WATCHONLY_MASTER_KEY", raising=False)
+    headers = {"Authorization": f"Bearer {superuser_token}"}
+    try:
+        await db.execute(
+            "DELETE FROM system_settings WHERE id = :id AND tag = 'core'",
+            {"id": KEY_RECORD},
+        )
+        created = await client.post("/admin/api/v1/onchain/key", headers=headers)
+        assert created.status_code == 200
+        backup = await client.post("/admin/api/v1/onchain/key/backup", headers=headers)
+        assert backup.status_code == 200
+        saved_key = key_path().read_text()
+        confirmed = await client.post(
+            "/admin/api/v1/onchain/key/confirm",
+            headers={
+                **headers,
+                "X-Onchain-Key-Fingerprint": backup.json()["fingerprint"],
+            },
+        )
+        assert confirmed.status_code == 200
+        enabled = await client.patch(
+            "/admin/api/v1/settings",
+            headers=headers,
+            json={"lnbits_allow_onchain_payments": True},
+        )
+        assert enabled.status_code == 200
+        assert settings.lnbits_allow_onchain_payments
+        normal_settings = await client.get("/admin/api/v1/settings", headers=headers)
+        assert backup.json()["key"] not in normal_settings.text
+        await reset_core_settings()
+        assert key_path().read_text() == saved_key
+        status = await client.get("/admin/api/v1/onchain/key", headers=headers)
+        assert status.json()["backup_confirmed"]
+        assert status.json()["fingerprint"] == backup.json()["fingerprint"]
+    finally:
+        await db.execute(
+            "DELETE FROM system_settings WHERE id = :id AND tag = 'core'",
+            {"id": KEY_RECORD},
+        )
+        if original:
+            await set_settings_field(KEY_RECORD, original.value)

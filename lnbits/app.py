@@ -1,0 +1,626 @@
+import asyncio
+import importlib
+import os
+import shutil
+import sys
+import time
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from loguru import logger
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from starlette.middleware.gzip import GZipMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+
+from lnbits.core.crud import (
+    get_db_version,
+    get_installed_extensions,
+    update_installed_extension_state,
+)
+from lnbits.core.crud.audit import delete_expired_audit_entries
+from lnbits.core.crud.extensions import create_installed_extension
+from lnbits.core.helpers import migrate_extension_database
+from lnbits.core.models.notifications import NotificationType
+from lnbits.core.services.extensions import deactivate_extension, get_valid_extensions
+from lnbits.core.services.funding_source import (
+    check_balance_delta_changed,
+    check_server_balance_against_node,
+)
+from lnbits.core.services.notifications import (
+    dispatch_payment_notification,
+    enqueue_admin_notification,
+    process_next_notification,
+)
+from lnbits.core.services.onchain import sync_wallets
+from lnbits.core.services.payments import (
+    check_pending_payments,
+    fundingsource_invoice_producer,
+)
+from lnbits.core.services.scheduler import scheduler, stop_scheduler_safely
+from lnbits.core.tasks import (
+    audit_queue,
+    collect_exchange_rates_data,
+    notify_server_status,
+    process_next_audit_entry,
+    refresh_extension_cache,
+)
+from lnbits.core.wasm_ext.routes.register import (
+    register_wasm_extension,
+    unregister_wasm_extension,
+)
+from lnbits.core.wasm_ext.wasm.events import dispatch_wasm_invoice_paid
+from lnbits.core.wasm_ext.wasm.loader import (
+    is_wasm_extension_dir,
+    is_wasm_extension_id,
+)
+from lnbits.core.wasm_ext.wasm.scheduler import ensure_wasm_extension_schedules
+from lnbits.exceptions import register_exception_handlers
+from lnbits.helpers import version_parse
+from lnbits.llms_txt import create_llms_txt_route
+from lnbits.settings import settings
+from lnbits.utils.cache import cache
+from lnbits.utils.logger import (
+    configure_logger,
+    initialize_server_websocket_logger,
+    log_server_info,
+)
+from lnbits.wallets import get_funding_source, set_funding_source
+
+from .commands import migrate_databases
+from .core import init_core_routers
+from .core.db import core_app_extra
+from .core.models.extensions import Extension, ExtensionMeta, InstallableExtension
+from .core.services import check_admin_settings, check_webpush_settings
+from .core.services.two_factor import sync_two_factor_policy
+from .middleware import (
+    AuditMiddleware,
+    ExtensionsRedirectMiddleware,
+    InstalledExtensionMiddleware,
+    add_first_install_middleware,
+    add_ip_block_middleware,
+    add_profiler_middleware,
+    add_ratelimit_middleware,
+)
+from .task_manager import task_manager
+
+
+async def startup(app: FastAPI):
+    logger.info(f"Starting LNbits Version: {settings.version}")
+    start = time.perf_counter()
+    settings.lnbits_running = True
+    # wait till migration is done
+    await migrate_databases()
+
+    # setup admin settings
+    await check_admin_settings()
+    await sync_two_factor_policy()
+    core_app_extra.register_new_ratelimiter()
+    await check_webpush_settings()
+
+    # check extensions after restart
+    if not settings.lnbits_extensions_deactivate_all:
+        await check_and_register_extensions(app)
+
+    log_server_info()
+
+    # initialize WALLET
+    try:
+        set_funding_source()
+    except Exception as e:
+        logger.error(f"Error initializing {settings.lnbits_backend_wallet_class}: {e}")
+        set_void_wallet_class()
+
+    # initialize funding source
+    await check_funding_source()
+
+    # register core routes
+    init_core_routers(app)
+
+    # register llms.txt endpoint for AI agents
+    create_llms_txt_route(app)
+
+    # initialize tasks
+    register_async_tasks()
+
+    enqueue_admin_notification(
+        NotificationType.server_start_stop,
+        {
+            "message": "LNbits server started.",
+            "up_time": settings.lnbits_server_up_time,
+        },
+    )
+
+    end = time.perf_counter()
+    logger.success(f"LNbits started in {end - start:.2f} seconds.")
+
+
+async def shutdown():
+    logger.warning("LNbits shutting down...")
+    enqueue_admin_notification(
+        NotificationType.server_start_stop,
+        {
+            "message": "LNbits server shutting down...",
+            "up_time": settings.lnbits_server_up_time,
+        },
+    )
+    settings.lnbits_running = False
+
+    # shutdown event
+    await stop_scheduler_safely()
+    task_manager.cancel_all_tasks()
+
+    # Give cancelled tasks a chance to finish their cleanup.
+    await asyncio.sleep(0.1)
+    funding_source = get_funding_source()
+    await funding_source.cleanup()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await startup(app)
+    yield
+    await shutdown()
+
+
+def create_app() -> FastAPI:
+    configure_logger()
+    app = FastAPI(
+        title=settings.lnbits_title,
+        description=(
+            "API for LNbits, the free and open source bitcoin wallet and "
+            "accounts system with plugins."
+        ),
+        version=settings.version,
+        lifespan=lifespan,
+        license_info={
+            "name": "MIT License",
+            "url": "https://raw.githubusercontent.com/lnbits/lnbits/main/LICENSE",
+        },
+    )
+
+    # Allow registering new extensions routes without direct access to the `app` object
+    core_app_extra.register_new_ext_routes = register_new_ext_routes(app)
+    core_app_extra.register_new_wasm_ext_routes = register_new_wasm_ext_routes(app)
+    core_app_extra.unregister_wasm_ext_routes = unregister_wasm_ext_routes(app)
+    core_app_extra.register_new_ratelimiter = register_new_ratelimiter(app)
+
+    # register static files
+    app.mount("/static", StaticFiles(directory=Path("lnbits", "static")), name="static")
+    Path(settings.lnbits_data_folder, "images").mkdir(parents=True, exist_ok=True)
+    app.mount(
+        "/library",
+        StaticFiles(directory=Path(settings.lnbits_data_folder, "images")),
+        name="library",
+    )
+
+    app.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    )
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+    app.add_middleware(AuditMiddleware, audit_queue=audit_queue)
+
+    # required for SSO login
+    app.add_middleware(SessionMiddleware, secret_key=settings.auth_secret_key)
+
+    # order of these two middlewares is important
+    app.add_middleware(InstalledExtensionMiddleware)
+    app.add_middleware(ExtensionsRedirectMiddleware)
+
+    register_custom_extensions_path()
+
+    add_first_install_middleware(app)
+
+    # adds security middleware
+    add_ip_block_middleware(app)
+    add_ratelimit_middleware(app)
+
+    register_exception_handlers(app)
+
+    if settings.profiler:
+        add_profiler_middleware(app)
+
+    return app
+
+
+async def check_funding_source() -> None:
+    funding_source = get_funding_source()
+
+    max_retries = settings.funding_source_max_retries
+    retry_counter = 0
+
+    while settings.lnbits_running:
+        try:
+            logger.info(f"Connecting to backend {funding_source.__class__.__name__}...")
+            error_message, balance = await funding_source.status()
+            if not error_message:
+                retry_counter = 0
+                logger.success(
+                    f"✔️ Backend {funding_source.__class__.__name__} connected "
+                    f"and with a balance of {balance} msat."
+                )
+                break
+            logger.error(
+                f"The backend for {funding_source.__class__.__name__} isn't "
+                f"working properly: '{error_message}'",
+                RuntimeWarning,
+            )
+        except Exception as e:
+            logger.error(
+                f"Error connecting to {funding_source.__class__.__name__}: {e}"
+            )
+
+        if retry_counter >= max_retries:
+            set_void_wallet_class()
+            funding_source = get_funding_source()
+            break
+
+        retry_counter += 1
+        sleep_time = min(0.25 * (2**retry_counter), 60)
+        logger.warning(
+            f"Retrying connection to backend in {sleep_time} seconds... "
+            f"({retry_counter}/{max_retries})"
+        )
+        await asyncio.sleep(sleep_time)
+
+
+def set_void_wallet_class():
+    logger.warning(
+        "Fallback to VoidWallet, because the backend for "
+        f"{settings.lnbits_backend_wallet_class} isn't working properly"
+    )
+    set_funding_source("VoidWallet")
+
+
+async def check_installed_extensions(app: FastAPI):
+    """
+    Check extensions that have been installed, but for some reason no longer present in
+    the 'lnbits/extensions' directory. One reason might be a docker-container that was
+    re-created. The 'data' directory (where the '.zip' files live) is expected to
+    persist state. Zips that are missing will be re-downloaded.
+    """
+
+    installed_extensions = await build_all_installed_extensions_list(False)
+
+    for ext in installed_extensions:
+        try:
+            installed = await check_installed_extension_files(ext)
+            if not installed:
+                await restore_installed_extension(app, ext)
+                logger.info(
+                    "✔️ Successfully re-installed extension: "
+                    f"{ext.id} ({ext.installed_version})"
+                )
+        except Exception as e:
+            logger.warning(e)
+            await deactivate_extension(ext.id)
+            logger.warning(
+                f"Failed to re-install extension: {ext.id} ({ext.installed_version})"
+            )
+
+    logger.info(f"Installed Extensions ({len(installed_extensions)}):")
+    for ext in installed_extensions:
+        logger.info(f"{ext.id} ({ext.installed_version})")
+
+
+async def build_all_installed_extensions_list(  # noqa: C901
+    include_deactivated: bool | None = True,
+) -> list[InstallableExtension]:
+    """
+    Returns a list of all the installed extensions plus the extensions that
+    MUST be installed by default (see LNBITS_EXTENSIONS_DEFAULT_INSTALL).
+    """
+    installed_extensions = await get_installed_extensions()
+    settings.lnbits_installed_extensions_ids = {e.id for e in installed_extensions}
+
+    settings.wasm_extensions_dir.mkdir(parents=True, exist_ok=True)
+    for ext_dir in settings.wasm_extensions_dir.iterdir():
+        try:
+            if not ext_dir.is_dir() or not is_wasm_extension_dir(ext_dir):
+                continue
+            ext_id = ext_dir.name
+            if ext_id in settings.lnbits_installed_extensions_ids:
+                continue
+            ext_info = InstallableExtension.from_wasm_ext_dir(ext_id)
+            if not ext_info:
+                continue
+
+            installed_extensions.append(ext_info)
+            settings.lnbits_installed_extensions_ids.add(ext_id)
+            await create_installed_extension(ext_info)
+            current_version = await get_db_version(ext_id)
+            await migrate_extension_database(ext_info, current_version)
+
+        except Exception as e:
+            logger.warning(e)
+
+    ext_dir_path = Path(settings.lnbits_extensions_path, "extensions")
+    existing_ext_dirs = ext_dir_path.iterdir() if ext_dir_path.is_dir() else []
+    for ext_dir in existing_ext_dirs:
+        try:
+            if not ext_dir.is_dir():
+                continue
+            ext_id = ext_dir.name
+            if ext_id in settings.lnbits_installed_extensions_ids:
+                continue
+            ext_info = InstallableExtension.from_ext_dir(ext_id)
+            if not ext_info:
+                continue
+
+            installed_extensions.append(ext_info)
+            await create_installed_extension(ext_info)
+            current_version = await get_db_version(ext_id)
+            await migrate_extension_database(ext_info, current_version)
+
+        except Exception as e:
+            logger.warning(e)
+
+    for ext_id in settings.lnbits_extensions_default_install:
+        if ext_id in settings.lnbits_installed_extensions_ids:
+            continue
+
+        ext_releases = await InstallableExtension.get_extension_releases(ext_id)
+        ext_releases = sorted(
+            ext_releases, key=lambda r: version_parse(r.version), reverse=True
+        )
+
+        release = next((e for e in ext_releases if e.is_version_compatible), None)
+
+        if release:
+            ext_meta = ExtensionMeta(installed_release=release)
+            ext_info = InstallableExtension(
+                id=ext_id,
+                name=ext_id,
+                version=release.version,
+                icon=release.icon,
+                meta=ext_meta,
+            )
+            installed_extensions.append(ext_info)
+
+    if include_deactivated:
+        return installed_extensions
+
+    if settings.lnbits_extensions_deactivate_all:
+        return []
+
+    return [
+        e
+        for e in installed_extensions
+        if e.id not in settings.lnbits_deactivated_extensions
+    ]
+
+
+async def check_installed_extension_files(ext: InstallableExtension) -> bool:
+    if ext.is_wasm or ext.has_installed_version:
+        return True
+
+    # zip_path is absolute under LNBITS_DATA_FOLDER. The old comparison
+    # `f"./{ext.zip_path}" not in glob(...)` never matched absolute paths, so a
+    # present zip was treated as missing and deleted inside download_archive()
+    # before re-download — fatal when network/DNS is down (e.g. Docker recreate).
+    if not ext.zip_path.is_file():
+        await ext.download_archive()
+    archive_config = ext.load_archive_config()
+    if archive_config.get("extension_type") == "wasm":
+        ext.extract_wasm_archive()
+    else:
+        ext.extract_archive()
+
+    return False
+
+
+async def restore_installed_extension(app: FastAPI, ext: InstallableExtension):
+    await update_installed_extension_state(ext_id=ext.id, active=True)
+
+    extension = Extension.from_installable_ext(ext)
+    register_ext_routes(app, extension)
+
+    current_version = await get_db_version(ext.id)
+    await migrate_extension_database(ext, current_version)
+
+    # mount routes for the new version
+    core_app_extra.register_new_ext_routes(extension)
+
+
+def register_custom_extensions_path():
+    upgrades_dir = settings.lnbits_extensions_upgrade_path
+    shutil.rmtree(upgrades_dir, True)
+    Path(upgrades_dir).mkdir(parents=True, exist_ok=True)
+
+    if settings.has_default_extension_path:
+        return
+    default_ext_path = os.path.join("lnbits", "extensions")
+    if os.path.isdir(default_ext_path) and len(os.listdir(default_ext_path)) != 0:
+        logger.warning(
+            "You are using a custom extensions path, "
+            + "but the default extensions directory is not empty. "
+            + f"Please clean-up the '{default_ext_path}' directory."
+        )
+        logger.warning(
+            f"You can move the existing '{default_ext_path}' directory to: "
+            + f" '{settings.lnbits_extensions_path}/extensions'"
+        )
+
+    extensions_dir = Path(settings.lnbits_extensions_path, "extensions")
+    Path(extensions_dir).mkdir(parents=True, exist_ok=True)
+    sys.path.append(str(extensions_dir))
+    settings.wasm_extensions_dir.mkdir(parents=True, exist_ok=True)
+
+
+def register_new_ext_routes(app: FastAPI) -> Callable:
+    # Returns a function that registers new routes for an extension.
+    # The returned function encapsulates (creates a closure around)
+    # the `app` object but does expose it.
+    def register_new_ext_routes_fn(ext: Extension):
+        register_ext_routes(app, ext)
+
+    return register_new_ext_routes_fn
+
+
+def register_new_wasm_ext_routes(app: FastAPI) -> Callable:
+    def register_new_wasm_ext_routes_fn(ext_id: str):
+        register_wasm_extension(app, ext_id)
+
+    return register_new_wasm_ext_routes_fn
+
+
+def unregister_wasm_ext_routes(app: FastAPI) -> Callable:
+    def unregister_wasm_ext_routes_fn(ext_id: str):
+        unregister_wasm_extension(app, ext_id)
+
+    return unregister_wasm_ext_routes_fn
+
+
+def register_new_ratelimiter(app: FastAPI) -> Callable:
+    def register_new_ratelimiter_fn():
+        limiter = Limiter(
+            key_func=get_remote_address,
+            default_limits=[
+                f"{settings.lnbits_rate_limit_no}/{settings.lnbits_rate_limit_unit}"
+            ],
+        )
+        app.state.limiter = limiter
+
+    return register_new_ratelimiter_fn
+
+
+def register_ext_tasks(ext: Extension) -> None:
+    """Register extension async tasks."""
+    ext_module = importlib.import_module(ext.module_name)
+
+    if hasattr(ext_module, f"{ext.code}_start"):
+        ext_start_func = getattr(ext_module, f"{ext.code}_start")
+        ext_start_func()
+
+
+def register_ext_routes(app: FastAPI, ext: Extension) -> None:
+    """Register FastAPI routes for extension."""
+    module_name = ext.module_name
+    # Clear all cached sub-modules so a fresh import picks up new files from ext_dir.
+    # A simple reload() would reuse cached sub-modules (e.g. views_api) and serve
+    # stale code even after the extension files have been replaced on disk.
+    stale = [
+        k for k in sys.modules if k == module_name or k.startswith(f"{module_name}.")
+    ]
+    for k in stale:
+        del sys.modules[k]
+    if stale:
+        # Pydantic v1 keeps a global _FUNCS set of validator qualnames to detect
+        # duplicates. Clear the extension's entries so reimport doesn't raise
+        # "duplicate validator" errors for validators with the same qualname.
+        try:
+            import pydantic.class_validators as _pydantic_cv
+
+            _pydantic_cv._FUNCS = {
+                f for f in _pydantic_cv._FUNCS if not f.startswith(f"{module_name}.")
+            }
+        except (ImportError, AttributeError):
+            pass
+    ext_module = importlib.import_module(module_name)
+
+    ext_route = getattr(ext_module, f"{ext.code}_ext")
+
+    ext_redirects = (
+        getattr(ext_module, f"{ext.code}_redirect_paths")
+        if hasattr(ext_module, f"{ext.code}_redirect_paths")
+        else []
+    )
+
+    settings.activate_extension_paths(ext.code, ext_redirects)
+
+    # Remove existing routes for this extension before re-registering so that
+    # an upgraded extension replaces the old one at the same paths (no prefix).
+    ext_prefix = f"/{ext.code}"
+    app.router.routes = [
+        r
+        for r in app.router.routes
+        if not (
+            getattr(r, "path", "") == ext_prefix
+            or getattr(r, "path", "").startswith(f"{ext_prefix}/")
+        )
+    ]
+    # Invalidate FastAPI's cached OpenAPI schema so the next /openapi.json
+    # request reflects the updated routes.
+    app.openapi_schema = None
+
+    if hasattr(ext_module, f"{ext.code}_static_files"):
+        ext_statics = getattr(ext_module, f"{ext.code}_static_files")
+        for s in ext_statics:
+            static_dir = Path(
+                settings.lnbits_extensions_path, "extensions", *s["path"].split("/")
+            )
+            app.mount(s["path"], StaticFiles(directory=static_dir), s["name"])
+
+    logger.trace(f"Adding route for extension {ext_module}.")
+    app.include_router(router=ext_route)
+
+
+async def check_and_register_extensions(app: FastAPI) -> None:
+    await check_installed_extensions(app)
+    for ext in await get_valid_extensions(False):
+        try:
+            if is_wasm_extension_id(ext.code):
+                register_wasm_extension(app, ext.code)
+                await ensure_wasm_extension_schedules(ext.code)
+                continue
+            register_ext_routes(app, ext)
+            register_ext_tasks(ext)
+        except Exception as exc:
+            logger.error(f"Could not load extension `{ext.code}`: {exc!s}")
+            await update_installed_extension_state(ext_id=ext.code, active=False)
+
+
+def register_async_tasks() -> None:
+    task_manager.init()
+
+    # listen to all incoming payments and dispatch payment notifications
+    # note: should be the first in task list for a bit quicker notifications
+    task_manager.register_invoice_listener(dispatch_payment_notification, "core")
+    task_manager.create_permanent_task(scheduler.run, name="core_scheduler")
+
+    # Core onchain wallets retain their snapshots when no browser is open.
+    task_manager.create_permanent_task(sync_wallets, interval=60)
+
+    # periodic tasks
+    task_manager.create_permanent_task(cache.invalidate_cache, interval=10)
+    task_manager.create_permanent_task(delete_expired_audit_entries, interval=60 * 60)
+    task_manager.create_permanent_task(
+        check_pending_payments,
+        interval=settings.lnbits_funding_source_pending_interval_seconds,
+    )
+    task_manager.create_permanent_task(
+        collect_exchange_rates_data,
+        interval=max(60, settings.lnbits_exchange_history_refresh_interval_seconds),
+    )
+    task_manager.create_permanent_task(check_balance_delta_changed, interval=60)
+    task_manager.create_permanent_task(
+        check_server_balance_against_node,
+        interval=60 * settings.lnbits_watchdog_interval_minutes,
+    )
+    task_manager.create_permanent_task(
+        notify_server_status,
+        interval=60 * 60 * settings.lnbits_notification_server_status_hours,
+    )
+    task_manager.create_permanent_task(refresh_extension_cache, interval=60)
+
+    # permanent tasks run in a loop, will be restarted if they fail
+    task_manager.create_permanent_task(fundingsource_invoice_producer)
+    task_manager.create_permanent_task(process_next_notification)
+    task_manager.create_permanent_task(process_next_audit_entry)
+
+    async def dispatch_extension_invoice_paid(payment) -> None:
+        await dispatch_wasm_invoice_paid(payment)
+
+    task_manager.register_invoice_listener(dispatch_extension_invoice_paid, "core_wasm")
+
+    # server logs for websocket
+    if settings.lnbits_admin_ui:
+        server_log_task = initialize_server_websocket_logger()
+        task_manager.create_permanent_task(
+            server_log_task, name="server_websocket_logger"
+        )

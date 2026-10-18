@@ -1,0 +1,265 @@
+const quasarConfig = {
+  config: {
+    loading: {
+      spinner: Quasar.QSpinnerBars
+    },
+    table: {
+      rowsPerPageOptions: [5, 10, 20, 50, 100, 200, 500, 0]
+    }
+  }
+}
+
+const DynamicComponent = {
+  async created() {
+    const name = this.$route.path.split('/')[1]
+    const path = `/${name}/`
+    const routesPath = `/${name}/static/routes.json`
+    if (this.$router.getRoutes().some(r => r.path === path)) return
+    if (this.$route.fullPath.startsWith('/extensions/builder/preview')) return
+    fetch(routesPath)
+      .then(async res => {
+        if (!res.ok) throw new Error('No dynamic routes found')
+        const routes = await res.json()
+        routes.forEach(r => {
+          console.log('Adding dynamic route:', r.path)
+          window.router.addRoute({
+            path: r.path,
+            name: r.name,
+            component: async () => {
+              await LNbits.utils.loadTemplate(r.template)
+              if (r.i18n) {
+                const locale =
+                  window.i18n?.global?.locale?.value ??
+                  window.i18n?.global?.locale ??
+                  window.g.locale ??
+                  'en'
+                await LNbits.utils.loadExtI18n(r.i18n, locale)
+              }
+              await LNbits.utils.loadScript(r.component)
+              return window[r.name]
+            }
+          })
+          window.router.push(this.$route.fullPath)
+        })
+      })
+      .catch(() => {
+        let route = RENDERED_ROUTE
+        // append trailing slash only on the root path `/path` -> `/path/`
+        if (route.split('/').length === 2) route += '/'
+        if (route !== this.$route.path) {
+          console.log('Redirecting to non-vue route:', this.$route.fullPath)
+          window.location = this.$route.fullPath
+          return
+        }
+      })
+  }
+}
+
+const routes = [
+  {
+    path: '/node',
+    name: 'Node',
+    component: PageNode
+  },
+  {
+    path: '/node/public',
+    name: 'NodePublic',
+    component: PageNodePublic
+  },
+  {
+    path: '/blockexplorer/:type(tx|address|block)?/:id?',
+    name: 'BlockExplorer',
+    component: PageBlockExplorer,
+    meta: {stableKey: true}
+  },
+  {
+    path: '/blockexplorer/public/:type(tx|address|block)?/:id?',
+    name: 'BlockExplorerPublic',
+    component: PageBlockExplorer,
+    meta: {stableKey: true}
+  },
+  {
+    path: '/payments',
+    name: 'Payments',
+    component: PagePayments
+  },
+  {
+    path: '/audit',
+    name: 'Audit',
+    component: PageAudit
+  },
+  {
+    path: '/scheduler',
+    name: 'Scheduler',
+    component: PageScheduler,
+    beforeEnter: () => {
+      if (!window.g.user?.admin || !window.g.settings.showAdmin) return '/'
+    }
+  },
+  {
+    path: '/scheduler/runs',
+    name: 'SchedulerRuns',
+    component: PageSchedulerRuns,
+    beforeEnter: () => {
+      if (!window.g.user?.admin || !window.g.settings.showAdmin) return '/'
+    }
+  },
+  {
+    path: '/wallet',
+    redirect: to => {
+      const walletId =
+        window.g?.lastActiveWallet || window.g?.user?.wallets[0].id
+      return `/wallet/${to.query.wal || walletId || 'default'}`
+    }
+  },
+  {
+    path: '/wallet/:id',
+    name: 'Wallet',
+    component: PageWallet
+  },
+  {
+    path: '/wallets',
+    name: 'Wallets',
+    component: PageWallets
+  },
+  {
+    path: '/users',
+    name: 'Users',
+    component: PageUsers
+  },
+  {
+    path: '/admin/extensions/wasm',
+    name: 'AdminWasmRuntime',
+    component: PageAdmin
+  },
+  {
+    path: '/admin/extensions/wasm/limits',
+    name: 'AdminWasmLimitConfig',
+    component: PageAdmin
+  },
+  {
+    path: '/admin/extensions/wasm/limits/:extId',
+    name: 'AdminWasmLimitConfigDetail',
+    component: PageAdmin
+  },
+  {
+    path: '/admin/extensions/wasm/:extId',
+    name: 'AdminWasmRuntimeDetail',
+    component: PageAdmin
+  },
+  {
+    path: '/admin',
+    name: 'Admin',
+    component: PageAdmin
+  },
+  {
+    path: '/account',
+    name: 'Account',
+    component: PageAccount
+  },
+  {
+    path: '/extensions/builder',
+    name: 'ExtensionsBuilder',
+    component: PageExtensionBuilder
+  },
+  {
+    path: '/extensions/builder/preview',
+    name: 'ExtensionsBuilderPreview',
+    component: PageExtensionBuilderPreview
+  },
+  {
+    path: '/extensions',
+    name: 'Extensions',
+    component: PageExtensions
+  },
+  {
+    path: '/first_install',
+    name: 'FirstInstall',
+    component: PageFirstInstall
+  },
+  {
+    path: '/',
+    name: 'PageHome',
+    component: PageHome
+  },
+  {
+    path: '/error',
+    name: 'PageError',
+    component: PageError
+  },
+  {
+    path: '/ext/:extId',
+    name: 'WasmExtensionRoot',
+    component: window.WasmExtensionComponent
+  },
+  {
+    path: '/ext/:extId/:pathMatch(.*)*',
+    name: 'WasmExtension',
+    component: window.WasmExtensionComponent
+  },
+  {
+    path: '/:pathMatch(.*)*',
+    name: 'DynamicComponent',
+    component: DynamicComponent
+  }
+]
+
+window.router = VueRouter.createRouter({
+  history: VueRouter.createWebHistory(),
+  routes
+})
+
+// BACKWARDS compatibility extensions
+window.LOCALE = window.g.locale
+
+window.i18n = new VueI18n.createI18n({
+  locale: window.g.locale,
+  fallbackLocale: 'en',
+  messages: window.localisation
+})
+;(function () {
+  let _applying = false
+  let _target = null
+  Vue.watch(
+    () => window.i18n.global.locale,
+    async (locale, prevLocale) => {
+      if (_applying || !LNbits.utils._extI18nDirs.size) return
+      _target = locale
+      _applying = true
+      window.i18n.global.locale = prevLocale
+      _applying = false
+      await Promise.all(
+        [...LNbits.utils._extI18nDirs].map(dir =>
+          LNbits.utils.loadExtI18n(dir, locale)
+        )
+      )
+      if (_target !== locale) return
+      _applying = true
+      window.i18n.global.locale = locale
+      _applying = false
+    },
+    {flush: 'sync'}
+  )
+})()
+
+window.app.mixin({
+  data() {
+    return {
+      api: window._lnbitsApi,
+      utils: window._lnbitsUtils,
+      g: window.g
+    }
+  },
+  // backwards compatibility for extensions, should not be used in the future
+  methods: {
+    copyText: window._lnbitsUtils.copyText,
+    formatBalance: window._lnbitsUtils.formatBalance
+  }
+})
+
+window.app.use(VueQrcodeReader)
+window.app.use(Quasar, quasarConfig)
+
+window.app.use(window.i18n)
+window.app.use(window.router)
+window.app.mount('#vue')

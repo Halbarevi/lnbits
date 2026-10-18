@@ -1,0 +1,113 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          tag = os.environ["RELEASE_TAG"].removeprefix("v")
+          assert tag.replace("-rc", "rc") == version.replace("-rc", "rc"), "Tag and package version differ"
+          PYTHON
+      - name: Create github release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+        run: |
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --verify-tag --generate-notes --draft
+
+  docker:
+    if: github.repository == 'lnbits/lnbits'
+    needs: [ release ]
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  docker-latest:
+    if: github.repository == 'lnbits/lnbits'
+    needs: [ release ]
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: latest
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  docker-latest-rc:
+    if: github.repository == 'lnbits/lnbits'
+    needs: [ release ]
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: latest-rc
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  pypi:
+    needs: [ release ]
+    if: github.repository == 'lnbits/lnbits'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Build the project
+        run: uv build
+      - name: Publish to pypi
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_KEY }}
+        run: uv publish
+
+  appimage:
+    needs: [ release ]
+    uses: ./.github/workflows/appimage.yml
+    with:
+      tag_name: ${{ github.ref_name }}
+
+  windows:
+    needs: [ release ]
+    uses: ./.github/workflows/windows.yml
+    with:
+      tag_name: ${{ github.ref_name }}
+
+  macos:
+    needs: [ release ]
+    uses: ./.github/workflows/macos.yml
+    with:
+      tag_name: ${{ github.ref_name }}
+    secrets:
+      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}

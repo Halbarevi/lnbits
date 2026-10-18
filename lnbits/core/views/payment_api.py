@@ -1,0 +1,546 @@
+from hashlib import sha256
+from http import HTTPStatus
+from secrets import token_hex
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+)
+from fastapi.responses import JSONResponse
+from lnurl import url_decode
+
+from lnbits import bolt11
+from lnbits.core.crud.payments import (
+    get_payment_count_stats,
+    get_wallet_payment_total_breakdown,
+    get_wallets_stats,
+    update_payment,
+)
+from lnbits.core.crud.users import get_account
+from lnbits.core.db import db
+from lnbits.core.models import (
+    CancelInvoice,
+    CreateInvoice,
+    CreateLnurlWithdraw,
+    DecodePayment,
+    KeyType,
+    Payment,
+    PaymentCountField,
+    PaymentCountStat,
+    PaymentDailyStats,
+    PaymentFilters,
+    PaymentHistoryPoint,
+    PaymentTotalBreakdown,
+    PaymentWalletStats,
+    SettleInvoice,
+    SimpleStatus,
+    UpdatePaymentExtra,
+)
+from lnbits.core.models.payments import (
+    ChangePaymentStatus,
+    UpdatePaymentLabels,
+)
+from lnbits.core.models.users import AccountId, UserLabel
+from lnbits.core.models.wallets import BaseWalletTypeInfo
+from lnbits.core.services.payments import change_payment_status
+from lnbits.core.services.users import update_user_account
+from lnbits.db import Filters, Page
+from lnbits.decorators import (
+    WalletTypeInfo,
+    check_account_id_exists,
+    check_super_user,
+    parse_filters,
+    require_admin_key,
+    require_base_admin_key,
+    require_base_invoice_key,
+)
+from lnbits.exceptions import PaymentError
+from lnbits.helpers import (
+    filter_dict_keys,
+    generate_filter_params_openapi,
+    is_valid_label,
+)
+from lnbits.utils.bolt12 import decode_bolt12_offer, looks_like_bolt12_offer
+from lnbits.wallets.base import InvoiceResponse
+
+from ..crud import (
+    DateTrunc,
+    get_payments,
+    get_payments_history,
+    get_payments_paginated,
+    get_standalone_payment,
+    get_wallet_for_key,
+)
+from ..services import (
+    cancel_hold_invoice,
+    create_payment_request,
+    fee_reserve_total,
+    get_payments_daily_stats,
+    pay_invoice,
+    pay_offer,
+    perform_withdraw,
+    settle_hold_invoice,
+    update_pending_payment,
+)
+
+payment_router = APIRouter(prefix="/api/v1/payments", tags=["Payments"])
+
+
+@payment_router.get(
+    "",
+    name="Payment List",
+    summary="get list of payments",
+    response_description="list of payments",
+    response_model=list[Payment],
+    openapi_extra=generate_filter_params_openapi(PaymentFilters),
+)
+async def api_payments(
+    key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
+    filters: Filters = Depends(parse_filters(PaymentFilters)),
+):
+    return await get_payments(
+        wallet_id=key_info.wallet.id,
+        pending=True,
+        complete=True,
+        filters=filters,
+    )
+
+
+@payment_router.get(
+    "/history",
+    name="Get payments history",
+    response_model=list[PaymentHistoryPoint],
+    openapi_extra=generate_filter_params_openapi(PaymentFilters),
+)
+async def api_payments_history(
+    key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
+    group: DateTrunc = Query("day"),
+    filters: Filters[PaymentFilters] = Depends(parse_filters(PaymentFilters)),
+):
+    return await get_payments_history(key_info.wallet.id, group, filters)
+
+
+@payment_router.get(
+    "/stats/count",
+    name="Get payments history for all users",
+    response_model=list[PaymentCountStat],
+    openapi_extra=generate_filter_params_openapi(PaymentFilters),
+)
+async def api_payments_counting_stats(
+    count_by: PaymentCountField = Query("tag"),
+    filters: Filters[PaymentFilters] = Depends(parse_filters(PaymentFilters)),
+    account_id: AccountId = Depends(check_account_id_exists),
+):
+    if account_id.is_admin_id:
+        # admin user can see payments from all wallets
+        for_user_id = None
+    else:
+        # regular user can only see payments from their wallets
+        for_user_id = account_id.id
+
+    return await get_payment_count_stats(count_by, filters=filters, user_id=for_user_id)
+
+
+@payment_router.get(
+    "/stats/breakdown",
+    name="Get wallet payment total breakdown",
+    response_model=list[PaymentTotalBreakdown],
+)
+async def api_payments_total_breakdown(
+    key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
+):
+    return await get_wallet_payment_total_breakdown(key_info.wallet.id)
+
+
+@payment_router.get(
+    "/stats/wallets",
+    name="Get payments history for all users",
+    response_model=list[PaymentWalletStats],
+    openapi_extra=generate_filter_params_openapi(PaymentFilters),
+)
+async def api_payments_wallets_stats(
+    filters: Filters[PaymentFilters] = Depends(parse_filters(PaymentFilters)),
+    account_id: AccountId = Depends(check_account_id_exists),
+):
+    if account_id.is_admin_id:
+        # admin user can see payments from all wallets
+        for_user_id = None
+    else:
+        # regular user can only see payments from their wallets
+        for_user_id = account_id.id
+
+    return await get_wallets_stats(filters, user_id=for_user_id)
+
+
+@payment_router.get(
+    "/stats/daily",
+    name="Get payments history per day",
+    response_model=list[PaymentDailyStats],
+    openapi_extra=generate_filter_params_openapi(PaymentFilters),
+)
+async def api_payments_daily_stats(
+    account_id: AccountId = Depends(check_account_id_exists),
+    filters: Filters[PaymentFilters] = Depends(parse_filters(PaymentFilters)),
+):
+    if account_id.is_admin_id:
+        # admin user can see payments from all wallets
+        for_user_id = None
+    else:
+        # regular user can only see payments from their wallets
+        for_user_id = account_id.id
+    return await get_payments_daily_stats(filters, user_id=for_user_id)
+
+
+@payment_router.get(
+    "/paginated",
+    name="Payment List",
+    summary="get paginated list of payments",
+    response_description="list of payments",
+    response_model=Page[Payment],
+    openapi_extra=generate_filter_params_openapi(PaymentFilters),
+)
+async def api_payments_paginated(
+    key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
+    recheck_pending: bool = Query(
+        False, description="Force check and update of pending payments."
+    ),
+    filters: Filters = Depends(parse_filters(PaymentFilters)),
+) -> Page[Payment]:
+    async with db.connect() as conn:
+        page = await get_payments_paginated(
+            wallet_id=key_info.wallet.id,
+            filters=filters,
+            conn=conn,
+        )
+        if not recheck_pending:
+            return page
+
+        payments = []
+        for payment in page.data:
+            if payment.pending:
+                refreshed_payment = await update_pending_payment(payment, conn=conn)
+                payments.append(refreshed_payment)
+            else:
+                payments.append(payment)
+
+    return Page(data=payments, total=page.total)
+
+
+@payment_router.get(
+    "/all/paginated",
+    name="Payment List",
+    summary="get paginated list of payments",
+    response_description="list of payments",
+    response_model=Page[Payment],
+    openapi_extra=generate_filter_params_openapi(PaymentFilters),
+)
+async def api_all_payments_paginated(
+    filters: Filters = Depends(parse_filters(PaymentFilters)),
+    account_id: AccountId = Depends(check_account_id_exists),
+):
+    if account_id.is_admin_id:
+        # admin user can see payments from all wallets
+        for_user_id = None
+    else:
+        # regular user can only see payments from their wallets
+        for_user_id = account_id.id
+
+    async with db.connect() as conn:
+        return await get_payments_paginated(
+            filters=filters, user_id=for_user_id, conn=conn
+        )
+
+
+@payment_router.post(
+    "",
+    summary="Create or pay an invoice",
+    description="""
+        This endpoint can be used to generate a BOLT11 invoice, pay a BOLT11
+        invoice, or pay a BOLT12 offer.
+        To generate a new invoice for receiving funds into the authorized account,
+        specify at least the first four fields in the POST body: `out: false`,
+        `amount`, `unit`, and `memo`. To pay an arbitrary invoice from the funds
+        already in the authorized account, specify `out: true` and use
+        `payment_request` to supply the BOLT11 invoice or BOLT12 offer (`lno1…`,
+        optional `lightning:` URI). Paying a BOLT12 offer requires `amount` in
+        `sat`. For offers, `memo` is sent to the recipient as a payer note.
+        The optional `webhook` field is honoured in both directions: LNbits POSTs
+        the payment to that URL once the payment reaches `success`.
+    """,
+    status_code=HTTPStatus.CREATED,
+    responses={
+        400: {"description": "Invalid BOLT11/BOLT12 string or missing fields."},
+        401: {"description": "Invoice (or Admin) key required."},
+        520: {"description": "Payment or Invoice error."},
+    },
+)
+async def api_payments_create(
+    invoice_data: CreateInvoice,
+    key_info: BaseWalletTypeInfo = Depends(require_base_invoice_key),
+) -> Payment:
+    wallet_id = key_info.wallet.id
+    if invoice_data.out is True and key_info.key_type == KeyType.admin:
+        if not invoice_data.payment_request:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Missing BOLT11 invoice or BOLT12 offer",
+            )
+        if looks_like_bolt12_offer(invoice_data.payment_request):
+            if invoice_data.unit != "sat":
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="BOLT12 offer amount must use unit 'sat'.",
+                )
+            amount_sat = None
+            if invoice_data.amount is not None:
+                amount_sat = int(invoice_data.amount)
+            return await pay_offer(
+                wallet_id=wallet_id,
+                offer=invoice_data.payment_request,
+                amount_sat=amount_sat,
+                extra=invoice_data.extra,
+                memo=invoice_data.memo,
+                labels=invoice_data.labels,
+                external_id=invoice_data.external_id,
+                webhook=invoice_data.webhook,
+            )
+        payment = await pay_invoice(
+            wallet_id=wallet_id,
+            payment_request=invoice_data.payment_request,
+            extra=invoice_data.extra,
+            description=invoice_data.memo or "",
+            labels=invoice_data.labels,
+            external_id=invoice_data.external_id,
+            webhook=invoice_data.webhook,
+        )
+        return payment
+
+    if invoice_data.out:
+        raise HTTPException(
+            status_code=HTTPStatus.FORBIDDEN,
+            detail="Invoice (or Admin) key required.",
+        )
+
+    # If the payment is not outgoing, we can create a new invoice.
+    return await create_payment_request(wallet_id, invoice_data)
+
+
+@payment_router.put("/{payment_hash}/labels")
+async def api_update_payment_labels(
+    payment_hash: str,
+    data: UpdatePaymentLabels,
+    key_type: BaseWalletTypeInfo = Depends(require_base_admin_key),
+) -> SimpleStatus:
+    payment = await get_standalone_payment(payment_hash, wallet_id=key_type.wallet.id)
+    if payment is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Payment does not exist.")
+    account = await get_account(key_type.wallet.user)
+    if not account:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Account does not exist.")
+
+    user_label_names = [label.name for label in account.extra.labels]
+    updated_account = False
+    for label_name in data.labels:
+        if label_name not in user_label_names:
+            if not is_valid_label(label_name):
+                raise HTTPException(
+                    HTTPStatus.BAD_REQUEST, f"Invalid label name: '{label_name}'."
+                )
+            account.extra.labels.append(
+                UserLabel(name=label_name, color=f"#{token_hex(3)}")
+            )
+            user_label_names.append(label_name)
+            updated_account = True
+
+    if updated_account:
+        await update_user_account(account)
+
+    payment.labels = data.labels
+    await update_payment(payment)
+    return SimpleStatus(success=True, message="Payment labels updated.")
+
+
+@payment_router.patch(
+    "/extra",
+    name="Update payment extra",
+    description="Append new extra metadata to a payment.",
+    response_model=Payment,
+)
+async def api_update_payment_extra(
+    data: UpdatePaymentExtra,
+    key_type: WalletTypeInfo = Depends(require_admin_key),
+) -> Payment:
+    payment = await get_standalone_payment(
+        data.payment_hash, wallet_id=key_type.wallet.id
+    )
+    if payment is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Payment does not exist.")
+    if not payment.success:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST, "Payment extra can only be updated after success."
+        )
+
+    duplicate_keys = sorted(set(payment.extra).intersection(data.extra))
+    if duplicate_keys:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            f"Extra keys already exist: {', '.join(duplicate_keys)}.",
+        )
+
+    payment.extra.update(data.extra)
+    await update_payment(payment)
+    return payment
+
+
+@payment_router.patch("/status", dependencies=[Depends(check_super_user)])
+async def api_change_payment_status(data: ChangePaymentStatus) -> Payment:
+    payment = await change_payment_status(
+        wallet_id=data.wallet_id,
+        checking_id=data.checking_id,
+        status=data.status,
+        send_payment_notifications=data.send_payment_notifications,
+        fee_msat=data.fee_msat,
+        preimage=data.preimage,
+    )
+    if payment is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Payment does not exist.")
+    return payment
+
+
+@payment_router.get("/fee-reserve")
+async def api_payments_fee_reserve(invoice: str = Query("invoice")) -> JSONResponse:
+    invoice_obj = bolt11.decode(invoice)
+    if invoice_obj.amount_msat:
+        response = {
+            "fee_reserve": fee_reserve_total(invoice_obj.amount_msat),
+        }
+        return JSONResponse(response)
+    else:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Invoice has no amount.",
+        )
+
+
+# TODO: refactor this route into a public and admin one
+@payment_router.get("/{payment_hash}")
+async def api_payment(payment_hash, x_api_key: str | None = Header(None)):
+    # We use X_Api_Key here because we want this call to work with and without keys
+    # If a valid key is given, we also return the field "details", otherwise not
+    wallet = await get_wallet_for_key(x_api_key) if isinstance(x_api_key, str) else None
+
+    payment = await get_standalone_payment(
+        payment_hash, wallet_id=wallet.id if wallet else None
+    )
+    if payment is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND, detail="Payment does not exist."
+        )
+
+    if payment.success:
+        if wallet and wallet.id == payment.wallet_id:
+            return {"paid": True, "preimage": payment.preimage, "details": payment}
+        return {"paid": True}
+
+    if payment.failed:
+        if wallet and wallet.id == payment.wallet_id:
+            return {"paid": False, "status": "failed", "details": payment}
+        return {"paid": False, "status": "failed"}
+
+    try:
+        payment = await update_pending_payment(payment)
+    except Exception:
+        if wallet and wallet.id == payment.wallet_id:
+            # do not expose the preimage of unpaid payments
+            payment.preimage = None
+            return {"paid": False, "details": payment}
+        return {"paid": False}
+
+    if wallet and wallet.id == payment.wallet_id:
+        return {
+            "paid": payment.success,
+            "status": f"{payment.status!s}",
+            # only expose the preimage once the payment is actually successful
+            "preimage": payment.preimage if payment.success else None,
+            "details": payment,
+        }
+    return {"paid": payment.success}
+
+
+@payment_router.post("/decode", status_code=HTTPStatus.OK)
+async def api_payments_decode(data: DecodePayment) -> JSONResponse:
+    payment_str = data.data
+    try:
+        if payment_str[:5] == "LNURL":
+            url = str(url_decode(payment_str))
+            return JSONResponse({"domain": url})
+        if looks_like_bolt12_offer(payment_str):
+            offer = decode_bolt12_offer(payment_str)
+            return JSONResponse({"type": "bolt12_offer", **offer.dict()})
+        invoice = bolt11.decode(payment_str)
+        filtered_data = filter_dict_keys(invoice.data, data.filter_fields)
+        return JSONResponse(filtered_data)
+    except PaymentError as exc:
+        return JSONResponse(
+            {"message": exc.message},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    except Exception as exc:
+        return JSONResponse(
+            {"message": f"Failed to decode: {exc!s}"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@payment_router.post("/settle")
+async def api_payments_settle(
+    data: SettleInvoice, key_type: WalletTypeInfo = Depends(require_admin_key)
+) -> InvoiceResponse:
+    payment_hash = sha256(bytes.fromhex(data.preimage)).hexdigest()
+    payment = await get_standalone_payment(
+        payment_hash, incoming=True, wallet_id=key_type.wallet.id
+    )
+    if not payment:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail="Payment does not exist or does not belong to this wallet.",
+        )
+    return await settle_hold_invoice(payment, data.preimage)
+
+
+@payment_router.post("/cancel")
+async def api_payments_cancel(
+    data: CancelInvoice, key_type: WalletTypeInfo = Depends(require_admin_key)
+) -> InvoiceResponse:
+    payment = await get_standalone_payment(
+        data.payment_hash, incoming=True, wallet_id=key_type.wallet.id
+    )
+    if not payment:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail="Payment does not exist or does not belong to this wallet.",
+        )
+    return await cancel_hold_invoice(payment)
+
+
+@payment_router.post("/{payment_request}/pay-with-nfc")
+async def api_payment_pay_with_nfc(
+    payment_request: str,
+    lnurl_data: CreateLnurlWithdraw,
+) -> SimpleStatus:
+    if not lnurl_data.lnurl_w.lud17:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="LNURL-withdraw lud17 not provided.",
+        )
+    try:
+        await perform_withdraw(lnurl_data.lnurl_w.lud17, payment_request)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+    return SimpleStatus(success=True, message="Payment sent with NFC.")

@@ -1,0 +1,128 @@
+import asyncio
+from time import time
+
+import pytest
+from pytest_mock.plugin import MockerFixture
+
+from lnbits.settings import Settings
+from lnbits.task_manager import task_manager
+from lnbits.utils.cache import Cache, Cached
+
+key = "foo"
+value = "bar"
+
+
+@pytest.fixture
+def cache():
+    return Cache()
+
+
+@pytest.mark.anyio
+async def test_cache_get_set(cache):
+    cache.set(key, value)
+    assert cache.get(key) == value
+    assert cache.get(key, default="default") == value
+    assert cache.get("i-dont-exist", default="default") == "default"
+
+
+@pytest.mark.anyio
+async def test_cache_expiry(cache, mocker: MockerFixture):
+    clock = mocker.patch("lnbits.utils.cache.time", return_value=1000.0)
+
+    # gets expired by `get` call
+    cache.set(key, value, expiry=1)
+    assert cache.get(key) == value
+    clock.return_value += 2
+    assert not cache.get(key)
+
+    # cleanup removes expired entries and preserves unexpired entries
+    cache.set(key, value, expiry=1)
+    cache.set("fresh", value, expiry=10)
+    clock.return_value += 2
+    await cache.invalidate_cache()
+    assert key not in cache._values
+    assert not cache.get(key)
+    assert cache.get("fresh") == value
+
+
+@pytest.mark.anyio
+async def test_cache_pop(cache):
+    cache.set(key, value)
+    assert cache.pop(key) == value
+    assert not cache.get(key)
+    assert cache.pop(key, default="a") == "a"
+
+
+@pytest.mark.anyio
+async def test_cache_coro(cache):
+    called = 0
+
+    async def test():
+        nonlocal called
+        called += 1
+        return called
+
+    await cache.save_result(test, key="test")
+    result = await cache.save_result(test, key="test")
+    assert result == called == 1
+
+
+def test_cached_older_than():
+    cached = Cached(value="value", expiry=time() - 5)
+
+    assert cached.older_than(1) is True
+    assert cached.older_than(10) is False
+
+
+@pytest.mark.anyio
+async def test_cache_value_returns_cached_metadata(cache):
+    cache.set(key, value, expiry=1)
+
+    cached = cache.value(key)
+
+    assert cached is not None
+    assert cached.value == value
+    assert cached.expiry > time()
+
+
+@pytest.mark.anyio
+async def test_cache_pop_expired_returns_default(cache):
+    cache.set(key, value, expiry=0.01)
+    await asyncio.sleep(0.02)
+
+    assert cache.pop(key, default="fallback") == "fallback"
+
+
+@pytest.mark.anyio
+async def test_invalidate_forever_logs_and_recovers_from_errors(
+    settings: Settings, mocker: MockerFixture
+):
+    test_cache = Cache()
+    original_running = settings.lnbits_running
+    calls = 0
+
+    original_invalidate = test_cache.invalidate_cache
+
+    async def fake_invalidate():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        settings.lnbits_running = False
+        await original_invalidate()
+
+    mocker.patch.object(test_cache, "invalidate_cache", side_effect=fake_invalidate)
+    logger_error = mocker.patch("lnbits.task_manager.logger.error")
+
+    bg_task = None
+    try:
+        settings.lnbits_running = True
+        bg_task = task_manager.create_permanent_task(test_cache.invalidate_cache)
+        await bg_task.task
+    finally:
+        settings.lnbits_running = original_running
+        if bg_task:
+            task_manager.cancel_task(bg_task)
+
+    assert logger_error.called
+    assert calls == 2
